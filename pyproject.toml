@@ -255,7 +255,7 @@ exclude = [
 artifacts = ["/src/openjarvis/server/static/**"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/openjarvis"]
+packages = ["src/openjarvis", "src/jarvis_ext"]
 artifacts = ["/src/openjarvis/server/static/**"]
 exclude = [
     "/src/openjarvis/agents/claude_code_runner",

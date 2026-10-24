@@ -1,0 +1,20 @@
+# Example JARVIS additions to ~/.openjarvis/config.toml
+# Copy the sections you need into your real config. Do not put secrets here.
+
+[jarvis.media_workspace]
+# Required. A dedicated folder that JARVIS may read; nothing outside it is visible.
+root = "~/Movies/JARVIS"
+
+# Optional settings (defaults shown).
+# follow_symlinks = false
+# include_hidden = false
+# probe_metadata = true
+# ffprobe_path = ""                # e.g. "/opt/homebrew/bin/ffprobe"
+# max_files = 100
+# max_depth = 8
+# ffprobe_timeout_seconds = 15
+# probe_budget_seconds = 60
+
+# Let agents use the tool by default.
+[tools]
+enabled = "media_workspace_inspect,think"

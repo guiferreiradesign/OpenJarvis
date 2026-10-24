@@ -183,4 +183,13 @@ try:
 except ImportError:
     pass
 
+# JARVIS fork: personal extension tools live outside the core in src/jarvis_ext.
+try:
+    import jarvis_ext  # noqa: F401
+except ImportError as _exc:
+    if getattr(_exc, "name", None) != "jarvis_ext":
+        import logging
+
+        logging.getLogger(__name__).warning("JARVIS extensions not loaded: %s", _exc)
+
 __all__ = ["BaseTool", "ToolExecutor", "ToolSpec"]
