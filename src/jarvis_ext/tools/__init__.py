@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+from jarvis_ext.tools.media_jobs import (
+    REVISE_TOOL,
+    STATUS_TOOL,
+    SUBMIT_TOOL,
+    MediaJobReviseTool,
+    MediaJobStatusTool,
+    MediaJobSubmitTool,
+)
 from jarvis_ext.tools.media_render import TOOL_NAME as _MEDIA_RENDER
 from jarvis_ext.tools.media_render import MediaRenderTool
 from jarvis_ext.tools.media_validate import TOOL_NAME as _MEDIA_VALIDATE
@@ -14,6 +22,9 @@ _TOOLS = {
     _MEDIA_WORKSPACE: MediaWorkspaceInspectTool,
     _MEDIA_RENDER: MediaRenderTool,
     _MEDIA_VALIDATE: MediaValidateTool,
+    SUBMIT_TOOL: MediaJobSubmitTool,
+    STATUS_TOOL: MediaJobStatusTool,
+    REVISE_TOOL: MediaJobReviseTool,
 }
 
 
@@ -25,6 +36,9 @@ def ensure_registered() -> None:
 
 
 __all__ = [
+    "MediaJobReviseTool",
+    "MediaJobStatusTool",
+    "MediaJobSubmitTool",
     "MediaRenderTool",
     "MediaValidateTool",
     "MediaWorkspaceInspectTool",

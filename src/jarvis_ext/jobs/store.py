@@ -39,6 +39,7 @@ from jarvis_ext.jobs.models import (
     MAX_ATTEMPTS,
     MAX_PAYLOAD_BYTES,
     MAX_RESULT_BYTES,
+    AmbiguousJobError,
     InvalidJobError,
     InvalidTransitionError,
     Job,
@@ -643,7 +644,7 @@ class JobStore:
         if not rows:
             raise JobNotFoundError(f"No job with id {id_or_prefix!r}")
         if len(rows) > 1:
-            raise JobNotFoundError(
+            raise AmbiguousJobError(
                 f"{id_or_prefix!r} matches more than one job; give more characters"
             )
         return _row_to_job(rows[0])

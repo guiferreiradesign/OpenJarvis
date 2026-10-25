@@ -10,10 +10,10 @@ untouched.
 | [AUDIT.md](AUDIT.md) | What OpenJarvis actually provides (from reading the source), what is missing, and the Claude authentication findings |
 | [media-workspace.md](media-workspace.md) | The first JARVIS capability: read-only media-workspace inspection |
 | [video-pipeline.md](video-pipeline.md) | Phase 2: `EditPlan`, `media_render`, `media_validate`, output versioning and safety |
-| [jobs.md](jobs.md) | Phase 3: job store, status rules and what is still planned |
+| [jobs.md](jobs.md) | Phase 3: jobs, worker and CLI, progress, notifications, revisions and reuse, agent job tools |
 | [examples/edit-plan.example.json](examples/edit-plan.example.json) | A complete example edit plan |
 | [DECISIONS.md](DECISIONS.md) | Architecture decisions and assumptions |
-| [ROADMAP.md](ROADMAP.md) | Phases 1–8 and the checklist of things to verify on the Mac |
+| [ROADMAP.md](ROADMAP.md) | Phases 1–8, the next milestone (First Usable Interface) and the Mac checklist |
 | [config.example.toml](config.example.toml) | Example `[jarvis.*]` configuration |
 
 ---
@@ -35,6 +35,7 @@ src/jarvis_ext/            # JARVIS extension package (custom code only)
         _video_base.py     #   config/FFmpeg plumbing shared by render/validate
         media_render.py    #   media_render tool
         media_validate.py  #   media_validate tool
+        media_jobs.py      #   media_job_submit / _status / _revise agent tools
     jobs/                  #   job store shared by all skills (Phase 3)
         models.py          #     Job, statuses, allowed transitions, validation
         store.py           #     SQLite store: submit, claim, finish, retry, cancel
@@ -106,7 +107,8 @@ The fork touches upstream files in exactly two places:
 | Email / notifications | **Available upstream** (channels) | Not configured; sending is out of scope for Phase 1 |
 | Video rendering from an explicit edit plan | **Implemented** (JARVIS) | `media_render` + `media_validate`, 1080×1920 Reels preset, versioned outputs, preview/thumbnail. Real-FFmpeg tested on macOS with generated media. See video-pipeline.md |
 | Autonomous editing ("strongest moments") | **Planned** | Phase 8 |
-| Custom dashboard | **Planned** | Phase 7 |
+| Render jobs for agents | **Implemented** (JARVIS) | `media_job_submit`, `media_job_status`, `media_job_revise` over the Phase 3 job worker. See jobs.md |
+| Custom dashboard | **Planned** | Next milestone: First Usable Interface (ROADMAP.md) |
 
 ## Quick start
 

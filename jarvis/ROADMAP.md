@@ -102,12 +102,12 @@ Still for you to do:
    libass) and/or local Whisper (`uv sync --extra speech` plus a one-off
    model download of about 75–145 MB).
 
-## Phase 3: jobs, status, notifications, revisions (in progress)
+## Phase 3: jobs, status, notifications, revisions (done)
 
 Goal: renders (and later other long-running skills) run as **jobs** that
 are tracked from submission to a final status, can be cancelled and
 retried safely, notify you, and support revisions. Approved decisions:
-D19–D24 and D27 in DECISIONS.md; design notes D25–D26 and D28–D32. Details: [jobs.md](jobs.md).
+D19–D24 and D27 in DECISIONS.md; design notes D25–D26 and D28–D33. Details: [jobs.md](jobs.md).
 
 | Step | Scope | Status |
 |---|---|---|
@@ -117,11 +117,74 @@ D19–D24 and D27 in DECISIONS.md; design notes D25–D26 and D28–D32. Details
 | 4 | Progress from FFmpeg `-progress`, in job status and on the event bus | **Done** |
 | 5 | Notifications on final status: log + macOS, from a crash-safe outbox | **Done** |
 | 6 | Revisions (complete new plan, child job), verified reuse of identical finished outputs, resuming a job's own published render | **Done** |
-| 7 | Agent tools and documentation, with RBAC tests | Planned |
+| 7 | Agent tools `media_job_submit`, `media_job_status`, `media_job_revise`, with RBAC tests | **Done** |
 
 Out of scope for Phase 3: writing plans from a brief, the video-editing
 skill itself, HyperFrames captions/graphics, external notification
 channels, parallel jobs, per-clip caching.
+
+## Next milestone: JARVIS First Usable Interface — Web, Text and Voice
+
+Not started. This is the first version meant for everyday use: talk to
+JARVIS by text or voice in a browser, watch and review its work, and
+approve what it may do. It brings forward the voice part of Phase 6 and
+the dashboard of Phase 7; the rest of those phases, and Phases 4–5, keep
+their place.
+
+**Scope**
+
+* A polished, responsive web interface (desktop and phone browsers).
+* Text chat and voice from the start: **push-to-talk** input and spoken
+  replies, with the text always shown.
+* A task area: jobs with status, stage, progress, history and finished
+  results (preview, thumbnail, output version, `reused_from`, revisions
+  as a parent/child chain), fed by the job store.
+* Review and approval controls: play a preview, accept it, or ask for a
+  revision; approve or deny actions that need confirmation.
+* A skills area that grows as skills are added (video first), listing what
+  each skill can do and the permissions it needs.
+* Clear permissions, an activity history (who asked for what, which tools
+  ran, what was approved) and safe approvals.
+
+**Architecture (direction, not yet a commitment)**
+
+* **Local-first.** The Mac is the first and only worker; the interface
+  talks to a backend on the Mac over localhost (or a private tunnel later,
+  Phase 5). No cloud service is required.
+* **Backend:** the existing OpenJarvis FastAPI server (`jarvis serve`,
+  `src/openjarvis/server/`) with its auth middleware, WebSocket/stream
+  bridge and approval routes. Agents use the same tools, `ToolExecutor`,
+  RBAC policy and confirmation rules as everywhere else; the job tools
+  (`media_job_*`) are the interface's way into jobs, so no separate path
+  bypasses validation, permissions or the worker. Job progress reaches the
+  browser by reading the job store (and, in the worker process, the
+  `jarvis_job_progress` event).
+* **Frontend: to evaluate first.** Option A: extend upstream `frontend/`
+  (React + Vite + Tailwind, already Tauri-ready); cheaper, but merges with
+  upstream and its telemetry (`posthog-js`) must be reviewed and turned
+  off. Option B: a small separate web app in the JARVIS tree talking to
+  the same API; cleaner ownership, more work. Decide after a short spike.
+* **Speech: interchangeable providers.** Upstream already has speech-to-
+  text (`faster_whisper`, `openai_whisper`, `deepgram`) and text-to-speech
+  (`kokoro_tts`, `openai_tts`, `elevenlabs_tts`, `cartesia_tts`) behind
+  common interfaces. Evaluate local processing first (faster-whisper,
+  Kokoro) for latency and quality on the Mac; paid providers only with
+  your approval (D21's no-paid-API rule still applies).
+* **Security:** the browser is just another client: authenticated,
+  bound to localhost by default, and subject to the same per-tool
+  capabilities, confirmation prompts and path-free results.
+
+**Later extensions (recorded, not part of this milestone)**
+
+* Packaging the web interface as a native Mac app, possibly with Tauri.
+* Phone-call notifications for genuinely urgent email, finished tasks and
+  other events you explicitly approve. This needs explicit permission,
+  configurable categories, severity thresholds, quiet hours, duplicate
+  prevention (the Step 5 outbox is a model), and a decision on what must
+  keep running when the Mac is asleep or offline (likely the Phase 5
+  cloud side).
+* More independent skills beyond video editing, using the same job,
+  tool and permission model.
 
 ## Phase 4: restricted Mac worker
 

@@ -10,8 +10,8 @@ the existing render and validate tools, a worker with a `jobs` CLI
 (submit, revise, list, show, cancel, worker), progress reporting from
 FFmpeg's real encoding position, a notification for every finished job
 (log, or macOS), revisions as child jobs, verified reuse of identical
-finished outputs, and resuming a job's own published render. Agent tools
-are step 7 in [ROADMAP.md](ROADMAP.md). The Phase 2 render pipeline is
+finished outputs, resuming a job's own published render, and agent tools
+for all of it (step 7). The next milestone is in [ROADMAP.md](ROADMAP.md). The Phase 2 render pipeline is
 unchanged apart from three additive, opt-in hooks: a stoppable process
 runner (D29), FFmpeg's `-progress` report (D30) and a `provenance` block
 in the render record (D32).
@@ -462,6 +462,54 @@ no longer produces a second version, and an interrupted validation is
 finished instead of failing the job. No database change was needed:
 provenance lives in the render record, the rest in the job's result.
 
+## Agent tools (step 7)
+
+Agents use jobs through three tools, registered with the other JARVIS
+tools (enable them in `[tools] enabled`, see
+[config.example.toml](config.example.toml)). They call the same code as
+the CLI (`make_payload`, `revision_payload`, the job store); the
+**worker** still does all rendering, validation, reuse, resuming and
+notifying. None of them renders, reads the workspace, writes to the
+output folder or changes a job's status.
+
+| Tool | Arguments | Does | Capabilities |
+|---|---|---|---|
+| `media_job_submit` | `plan` (object or JSON string), `reuse` (default true) | Checks the plan, queues a `video.render` job | `file:read`, `file:write`, `schedule:create` |
+| `media_job_revise` | `job_id`, `plan`, `reuse` | Checks the parent and plan, queues a child job (next version) | `file:read`, `file:write`, `schedule:create` |
+| `media_job_status` | `job_id` (optional) | One job's details, or the 10 most recent jobs | `file:read` |
+
+**Why these capabilities (D33).** A queued render will read the media
+workspace and write to the output folder, so queueing needs the same
+`file:read` + `file:write` as `media_render`; otherwise an agent denied
+`file:write` could get a render by queueing it. `schedule:create` marks
+that the work runs later, as for the upstream scheduler tools. Submit
+and revise also follow `[jarvis.media_render] require_confirmation`, so
+a confirmation rule for renders cannot be bypassed through the queue.
+Status only reads the job database: `file:read`. None needs
+`code:execute`, `network:fetch` or `system:admin`. These are checked by
+the OpenJarvis `ToolExecutor` against the RBAC `CapabilityPolicy` (and
+confirmation callback) for every call, whatever the client (CLI agent,
+server, future web interface).
+
+**Before anything is queued** the plan must parse as an `EditPlan` under
+the configured limits and presets, and every path (`clips[].source`,
+`subtitles.source`, `branding.asset`) must be plain relative (no absolute
+path, no `..`); for a revision, the parent must be a finished
+`video.render` job and the `output_name` must match. The CLI applies the
+same checks. Whether the files exist is checked when the job runs.
+
+**Results** are JSON with `status` (`ok`, `invalid_plan`,
+`invalid_arguments`, `not_found`, `ambiguous_job`, `not_revisable`,
+`config_error`, `job_store_error`) and, on failure, `error`. Status gives
+`job` (id, kind, status, stage, progress, attempts, parent, output name,
+times), `result` (output, `ready_for_review`, preview, thumbnail,
+`reused_from`, `resumed`, validation status), `error` (code, message,
+failed checks, a few warnings), `notification` (state, outcome) and the
+last 12 history notes, plus a `next_step` hint. Plans, payloads and
+render records are never returned; error messages and notes are cleaned
+(path-like text becomes `[path]`), and file names other than plain
+output-folder names (`reel_v001.mp4`, `review/…`) are withheld.
+
 ## Storage and safety
 
 * **Location:** `<OPENJARVIS_HOME>/jarvis/jobs.db` (normally
@@ -524,8 +572,21 @@ with open_job_store() as store:                  # reads [jarvis.jobs]
 ```bash
 uv run pytest tests/jarvis_ext/test_job_store.py tests/jarvis_ext/test_job_runner.py \
     tests/jarvis_ext/test_job_worker.py tests/jarvis_ext/test_job_progress.py \
-    tests/jarvis_ext/test_job_notifications.py tests/jarvis_ext/test_job_revisions.py -v
+    tests/jarvis_ext/test_job_notifications.py tests/jarvis_ext/test_job_revisions.py \
+    tests/jarvis_ext/test_media_jobs.py -v
 ```
+
+`test_media_jobs.py` covers the three agent tools: registration and
+discovery, construction without arguments under a broken config,
+schemas, declared capabilities, RBAC denial for every missing capability
+(nothing queued) and grants, confirmation, submit (JSON string plans,
+`reuse`, every kind of invalid input including absolute and `..` paths,
+store errors without paths), status (unknown, malformed and ambiguous
+ids, recent jobs, a failed job without leaking paths or plan contents,
+read-only), revise (child, refusals queue nothing, other kinds), with the
+worker and fake FFmpeg (submit → status → revise → reuse → `reuse:
+false`, cancellation and notifications), and a real-FFmpeg end-to-end
+run (submit, worker, status ready, revise to v002, v001 unchanged).
 
 `test_job_revisions.py` covers revision payloads and the `revise` CLI
 (child job and `parent_id`, output name kept or filled in, unfinished,

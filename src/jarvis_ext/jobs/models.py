@@ -60,6 +60,10 @@ class JobNotFoundError(JobError):
     """No job has the given id."""
 
 
+class AmbiguousJobError(JobNotFoundError):
+    """An id prefix matches more than one job."""
+
+
 class JobStatus(str, Enum):
     """Lifecycle states shared by every job kind."""
 
@@ -289,6 +293,7 @@ class JobEvent:
 
 
 __all__ = [
+    "AmbiguousJobError",
     "FINAL_STATUSES",
     "InvalidJobError",
     "InvalidTransitionError",

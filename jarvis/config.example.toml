@@ -58,4 +58,4 @@ output_root = "~/Movies/JARVIS-Renders"
 
 # Let agents use the tools by default.
 [tools]
-enabled = "media_workspace_inspect,media_render,media_validate,think"
+enabled = "media_workspace_inspect,media_render,media_validate,media_job_submit,media_job_status,media_job_revise,think"

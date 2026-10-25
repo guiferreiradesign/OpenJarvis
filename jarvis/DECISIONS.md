@@ -487,6 +487,21 @@ The cost (reading the sources once more) is small next to a render.
 good then; re-running it proves the file is still complete and decodable
 now and produces the review files a new job would have.
 
+## D33. Agent job tools need the capabilities of the work they queue
+
+**Decision:** `media_job_submit` and `media_job_revise` require
+`file:read`, `file:write` and `schedule:create`, and follow
+`[jarvis.media_render] require_confirmation`; `media_job_status`
+requires `file:read`. The tools only validate and queue (or read); the
+worker does the work. Plans are also checked for unsafe paths (absolute,
+`..`) before queueing, in the tools and the CLI.
+
+**Why:** a job is deferred execution of `media_render` +
+`media_validate`. Requiring less to queue than to render would let a
+restricted agent obtain a render indirectly. `schedule:create` is the
+existing capability for deferred work. Status exposes only job metadata
+and output-folder file names, never plans or paths.
+
 ## Assumptions
 
 * Only you (and processes you trust) write to the media workspace. See the

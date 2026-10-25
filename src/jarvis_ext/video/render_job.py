@@ -708,13 +708,20 @@ def read_payload(payload: Mapping[str, Any]) -> Tuple[Optional[dict], str]:
 
 
 class RevisionError(ValueError):
-    """A revision cannot be queued (unsuitable parent or invalid plan)."""
+    """A job cannot be queued: *code* is ``not_revisable`` (the parent is
+    unsuitable) or ``invalid_plan``."""
+
+    def __init__(self, message: str, code: str = "invalid_plan") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def check_plan(plan: Any, config_path: Optional[Path] = None) -> str:
     """``""`` if *plan* is a valid EditPlan under ``[jarvis.media_render]``,
-    else the reason.  Checks shape and values only; sources are checked
-    when the job runs."""
+    else the reason.  Checks shape and values, and that every path is a
+    plain relative one (the workspace's static rules: no absolute paths,
+    no ``..``); whether the files exist is checked when the job runs."""
+    from jarvis_ext._workspace import AccessDenied, split_relative
     from jarvis_ext.config import load_extension_section
     from jarvis_ext.video.settings import CONFIG_SECTION, MediaRenderSettings
 
@@ -722,9 +729,20 @@ def check_plan(plan: Any, config_path: Optional[Path] = None) -> str:
         load_extension_section(CONFIG_SECTION, config_path)
     )
     try:
-        parse_edit_plan(plan, settings.plan_limits)
+        parsed = parse_edit_plan(plan, settings.plan_limits)
     except PlanError as exc:
         return f"Invalid plan: {exc}"
+    paths = [(f"clips[{i}].source", c.source, "media workspace")
+             for i, c in enumerate(parsed.clips)]  # fmt: skip
+    if parsed.subtitles is not None:
+        paths.append(("subtitles.source", parsed.subtitles.source, "media workspace"))
+    if parsed.branding is not None:
+        paths.append(("branding.asset", parsed.branding.asset, "assets folder"))
+    for label, value, where in paths:
+        try:
+            split_relative(value, where=where)
+        except AccessDenied as exc:
+            return f"Invalid plan: {label}: {exc}"
     return ""
 
 
@@ -758,18 +776,20 @@ def revision_payload(
     are.  Raises :class:`RevisionError`; nothing is queued.
     """
     if parent.kind != KIND:
-        raise RevisionError(f"Only {KIND} jobs can be revised")
+        raise RevisionError(f"Only {KIND} jobs can be revised", "not_revisable")
     if not parent.is_final:
         raise RevisionError(
             f"Job {parent.id[:8]} is still {parent.status.value}; revise it once "
-            "it has finished (or cancel it first)."
+            "it has finished (or cancel it first).",
+            "not_revisable",
         )
     parent_plan, problem = read_payload(parent.payload)
     name = parent_plan.get("output_name") if parent_plan else None
     if not isinstance(name, str):
         raise RevisionError(
             f"Job {parent.id[:8]} has no usable plan to revise"
-            + (f" ({problem})" if problem else "")
+            + (f" ({problem})" if problem else ""),
+            "not_revisable",
         )
     if not isinstance(plan, dict) or not plan:
         raise RevisionError("A revision needs a complete EditPlan object")

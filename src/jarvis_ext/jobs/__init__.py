@@ -13,6 +13,7 @@ from jarvis_ext.jobs.models import (
     FINAL_STATUSES,
     MAX_ATTEMPTS,
     TRANSITIONS,
+    AmbiguousJobError,
     InvalidJobError,
     InvalidTransitionError,
     Job,
@@ -33,6 +34,7 @@ from jarvis_ext.jobs.store import (
 )
 
 __all__ = [
+    "AmbiguousJobError",
     "FINAL_STATUSES",
     "InvalidJobError",
     "InvalidTransitionError",
