@@ -27,14 +27,31 @@ Outcomes (DECISIONS.md D23, D27, D28):
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from jarvis_ext.jobs.runner import JobCancelled, JobContext, JobOutcome
+from jarvis_ext.jobs.models import Job, JobEvent, JobStatus
+from jarvis_ext.jobs.runner import (
+    STOP_CANCEL,
+    STOP_SHUTDOWN,
+    JobCancelled,
+    JobContext,
+    JobOutcome,
+    WorkerInterrupted,
+    current_stop_reason,
+)
+from jarvis_ext.video.ffmpeg import ProcessStopped, run_process_until
+from jarvis_ext.video.output import TMP_DIRNAME, OutputFolder
 from openjarvis.core.types import ToolResult
 
 KIND = "video.render"
+RENDER_STARTED_NOTE = "render started"
+RENDERED_NOTE_PREFIX = "rendered "
+_TEMP_PREFIX = "job-"  # OutputFolder.make_temp_dir's mkdtemp prefix
 
 # Render statuses worth one more attempt: a folder that was briefly
 # unavailable (drive unplugged, network volume), FFmpeg exiting with an
@@ -77,12 +94,19 @@ class VideoRenderHandler:
         validate_tool: Any = None,
         config_path: Optional[Path] = None,
     ) -> None:
+        self._config_path = config_path
         if render_tool is None or validate_tool is None:
             from jarvis_ext.tools.media_render import MediaRenderTool
             from jarvis_ext.tools.media_validate import MediaValidateTool
 
-            render_tool = render_tool or MediaRenderTool(config_path=config_path)
-            validate_tool = validate_tool or MediaValidateTool(config_path=config_path)
+            # Same tools as the CLI and agents use, with FFmpeg run through
+            # stoppable_run_process so cancellation and shutdown can stop it.
+            render_tool = render_tool or MediaRenderTool(
+                config_path=config_path, process_runner=stoppable_run_process
+            )
+            validate_tool = validate_tool or MediaValidateTool(
+                config_path=config_path, process_runner=stoppable_run_process
+            )
         self._render = render_tool
         self._validate = validate_tool
 
@@ -91,15 +115,31 @@ class VideoRenderHandler:
         if plan is None:
             return JobOutcome.failed("invalid_payload", problem)
 
-        if context.cancel_requested():
+        stop = context.stop_reason(fresh=True)
+        if stop == STOP_CANCEL:
             return JobOutcome.cancelled(
                 {"stage": "before_render", "output": None, "ready_for_review": False}
             )
+        if stop == STOP_SHUTDOWN:
+            return JobOutcome.retry(
+                "interrupted", "The worker stopped before rendering started"
+            )
 
-        # A JobCancelled raised during the render propagates: the render tool
-        # has then stopped FFmpeg and removed its temp folder, so nothing was
-        # published and the runner records the cancellation.
-        render = _report(self._render.execute(plan=plan))
+        context.note(RENDER_STARTED_NOTE)
+        try:
+            render = _report(self._render.execute(plan=plan))
+        except JobCancelled:
+            # FFmpeg was stopped inside the render tool, which then removed
+            # its temp folder: nothing was published.
+            return JobOutcome.cancelled(
+                {"stage": "during_render", "output": None, "ready_for_review": False}
+            )
+        except WorkerInterrupted:
+            return JobOutcome.retry(
+                "interrupted",
+                "The worker was stopped during the render; nothing was published",
+                {"stage": "during_render", "output": None, "ready_for_review": False},
+            )
         render_status = render.get("render_status")
         output = render.get("output") if isinstance(render.get("output"), dict) else {}
         file_name = output.get("file")
@@ -129,24 +169,27 @@ class VideoRenderHandler:
                 return JobOutcome.retry(code, message, result)
             return JobOutcome.failed(code, message, result)
 
-        context.note(f"rendered {file_name}")
-        if context.cancel_requested():
+        context.note(f"{RENDERED_NOTE_PREFIX}{file_name}")
+        unvalidated = (
+            f"{file_name} was published but not validated; it is not ready for review."
+        )
+        stop = context.stop_reason(fresh=True)
+        if stop is not None:
             result["stage"] = "after_render"
-            result["note"] = (
-                f"{file_name} was published but not validated; it is not ready "
-                "for review."
-            )
-            return JobOutcome.cancelled(result)
+            result["note"] = unvalidated
+            if stop == STOP_CANCEL:
+                return JobOutcome.cancelled(result)
+            return JobOutcome.failed("validate_interrupted", unvalidated, result)
 
         try:
             validation = _report(self._validate.execute(output=file_name))
-        except JobCancelled:
+        except (JobCancelled, WorkerInterrupted) as exc:
             result["stage"] = "during_validation"
-            result["note"] = (
-                f"{file_name} was published but not validated; it is not ready "
-                "for review."
-            )
-            return JobOutcome.cancelled(result)
+            result["note"] = unvalidated
+            if isinstance(exc, JobCancelled):
+                return JobOutcome.cancelled(result)
+            # Not retried: a retry would render a second version.
+            return JobOutcome.failed("validate_interrupted", unvalidated, result)
         status = validation.get("validation_status")
         result["validate"] = _validate_summary(validation)
         validated = (
@@ -172,6 +215,163 @@ class VideoRenderHandler:
             _message(validation, "Validation did not pass"),
             result,
         )
+
+    # -- worker hooks ----------------------------------------------------------
+
+    def recovery(self, job: Job, events: List[JobEvent]) -> Tuple[bool, str, str, dict]:
+        """How to settle this job after its worker died: ``(requeue, code,
+        message, result)``.  A cancellation request is honoured by the store
+        before this is applied.
+
+        If the history shows a published render, the job is *not* re-run (a
+        re-run would publish a second version); the file is reported as not
+        validated.  Otherwise no render was recorded as published, and the
+        job may be retried within its attempt limit.
+        """
+        rendered = [
+            e.note[len(RENDERED_NOTE_PREFIX) :]
+            for e in events
+            if e.from_status is JobStatus.RUNNING
+            and e.note.startswith(RENDERED_NOTE_PREFIX)
+        ]
+        if rendered:
+            name = rendered[-1]
+            return (
+                False,
+                "validate_interrupted",
+                f"The worker stopped after {name} was published; it was not "
+                "validated and is not ready for review.",
+                {"output": name, "ready_for_review": False, "stage": "after_render"},
+            )
+        return (
+            True,
+            "interrupted",
+            "The worker stopped before a render was published",
+            {"output": None, "ready_for_review": False},
+        )
+
+    def cleanup(self) -> List[str]:
+        """Remove abandoned temp folders in the output folder (see
+        :func:`remove_abandoned_temp_dirs`).  Call only while no job runs."""
+        from jarvis_ext.config import ExtensionConfigError, load_extension_section
+        from jarvis_ext.video.settings import CONFIG_SECTION, MediaRenderSettings
+
+        try:
+            settings = MediaRenderSettings.from_mapping(
+                load_extension_section(CONFIG_SECTION, self._config_path)
+            )
+        except ExtensionConfigError:
+            return []
+        if settings.output_root is None:
+            return []
+        return remove_abandoned_temp_dirs(
+            settings.output_root, older_than_seconds=abandoned_after(settings)
+        )
+
+
+def stoppable_run_process(
+    cmd: List[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    log_path: Path,
+    env: Optional[Mapping[str, str]] = None,
+) -> int:
+    """The tools' ``process_runner`` hook, stoppable by the running job.
+
+    Outside a job it behaves like ``run_process``.  Inside one, a cancel
+    request or a forced worker stop terminates FFmpeg's process group (the
+    existing ``_stop``: SIGTERM, then SIGKILL) and raises
+    :class:`JobCancelled` or :class:`WorkerInterrupted`.  The render tool's
+    cleanup then removes its temp folder, so nothing is published.
+    """
+    try:
+        return run_process_until(
+            cmd,
+            cwd=cwd,
+            timeout=timeout,
+            log_path=log_path,
+            env=env,
+            should_stop=current_stop_reason,
+        )
+    except ProcessStopped as exc:
+        if exc.reason == STOP_CANCEL:
+            raise JobCancelled() from None
+        raise WorkerInterrupted() from None
+
+
+def abandoned_after(settings: Any) -> float:
+    """Age after which a temp folder cannot belong to a live tool call.
+
+    A render runs one FFmpeg (stopped at ``render_timeout_seconds``); a
+    validation at most three (decode, preview, thumbnail), each stopped at
+    ``validate_timeout_seconds``.  Ten minutes are added for probing and
+    publishing.
+    """
+    return (
+        settings.render_timeout_seconds + 4 * settings.validate_timeout_seconds + 600.0
+    )
+
+
+def remove_abandoned_temp_dirs(
+    output_root: Path,
+    *,
+    older_than_seconds: float,
+    now: Optional[float] = None,
+) -> List[str]:
+    """Delete ``<output_root>/.jarvis-tmp/job-*`` folders nothing has touched
+    for *older_than_seconds*; return their names.
+
+    Only folders the render/validate tools create are considered: plain
+    directories (never symlinks) named ``job-*`` directly inside
+    ``.jarvis-tmp``.  A folder counts as abandoned only when it **and
+    everything in it** are older than the limit, so a folder an orphaned
+    FFmpeg is still writing to is kept.  Deletion goes through
+    ``OutputFolder.remove_temp_dir``, which refuses anything else.
+    Renders, records and ``review/`` files are never candidates.
+    """
+    current = time.time() if now is None else now
+    tmp_root = output_root / TMP_DIRNAME
+    try:
+        info = os.lstat(tmp_root)
+    except OSError:
+        return []
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return []
+    folder = OutputFolder(output_root)
+    removed = []
+    for entry in sorted(tmp_root.iterdir()):
+        try:
+            entry_info = os.lstat(entry)
+        except OSError:
+            continue
+        if (
+            not entry.name.startswith(_TEMP_PREFIX)
+            or stat.S_ISLNK(entry_info.st_mode)
+            or not stat.S_ISDIR(entry_info.st_mode)
+        ):
+            continue
+        newest = _newest_mtime(entry, entry_info.st_mtime)
+        if newest is None or current - newest < older_than_seconds:
+            continue
+        folder.remove_temp_dir(entry)
+        if not os.path.lexists(entry):
+            removed.append(entry.name)
+    return removed
+
+
+def _newest_mtime(directory: Path, own_mtime: float) -> Optional[float]:
+    newest = own_mtime
+    try:
+        for root, dirs, files in os.walk(directory, followlinks=False):
+            for name in dirs + files:
+                try:
+                    newest = max(newest, os.lstat(os.path.join(root, name)).st_mtime)
+                except OSError:
+                    return None  # changing under us: not abandoned
+    except OSError:
+        return None
+    return newest
 
 
 def read_payload(payload: Mapping[str, Any]) -> Tuple[Optional[dict], str]:
@@ -276,6 +476,9 @@ def _validate_summary(report: Mapping[str, Any]) -> Dict[str, Any]:
 
 __all__ = [
     "KIND",
+    "abandoned_after",
+    "remove_abandoned_temp_dirs",
+    "stoppable_run_process",
     "RENDER_PERMANENT",
     "RENDER_RETRYABLE",
     "VideoRenderHandler",

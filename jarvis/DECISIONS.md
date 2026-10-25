@@ -326,6 +326,58 @@ history. No schema change.
 **Not changed (D24):** the Phase 2 tools, render record and FFmpeg
 handling are untouched.
 
+## D29. Worker: flock, heartbeats, conservative recovery, stoppable FFmpeg
+
+**Decision:**
+
+* **Single instance:** an exclusive, non-blocking `flock` on
+  `<database>.worker.lock`. The kernel releases it when the process dies,
+  so there are no stale locks to clean up. The lock is the only way the
+  worker runs jobs; jobs still run one at a time (D20).
+* **Heartbeat:** schema version 2 adds `heartbeat_at` and `not_before`
+  (an in-place `ALTER TABLE` migration; version 1 files upgrade on open).
+  The runner sends a heartbeat every `heartbeat_seconds` from a background
+  thread while a handler runs.
+* **Recovery:** a running job is "abandoned" only if its heartbeat is older
+  than `stale_after_seconds` (≥ 3 heartbeats), it is not this worker's,
+  and this worker holds the lock. `JobStore.recover` re-checks the
+  heartbeat age in the same write transaction. A cancellation request wins
+  (→ `cancelled`). Otherwise the handler decides whether the attempt can be
+  repeated: the video handler requeues only if no `rendered <file>` note
+  exists, and otherwise fails the job with the file listed as unvalidated,
+  so recovery never creates a second version from a known render. Attempt
+  limits are enforced by the store.
+* **Back-off:** `retry` and `recover` set `not_before = now +
+  retry_delay_seconds`; `claim_next` skips such jobs until then. Only
+  outcomes the handler already classifies as retryable are affected.
+* **Cancellation and forced stop of running FFmpeg:** the tools'
+  existing `process_runner` hook is given `stoppable_run_process`, which
+  uses a new `video/ffmpeg.py` function, `run_process_until`. It is
+  `run_process` plus a poll: every 0.25 s it asks the running job whether
+  to stop (the store is read at most every 0.5 s), and it then stops the
+  process group with the existing `_stop` (SIGTERM, then SIGKILL, reaped).
+  `run_process` and the render/validate code are unchanged. The handler
+  turns the resulting `JobCancelled` / `WorkerInterrupted` into outcomes
+  by stage: during the render nothing was published (the tool removes its
+  temp folder), so a shutdown requeues; after the render was published, a
+  shutdown fails as `validate_interrupted` instead of re-rendering.
+* **Graceful vs forced shutdown:** the first SIGINT/SIGTERM finishes the
+  current job; a second one forces the stop above.
+* **Temp cleanup:** only `<output_root>/.jarvis-tmp/job-*` directories
+  (the `mkdtemp` prefix `OutputFolder` uses), only when they and all their
+  contents are older than the longest a live tool call can take
+  (`render_timeout + 4 × validate_timeout + 10 min`), deleted through
+  `OutputFolder.remove_temp_dir`. Temp folders carry no job id, so age is
+  the ownership evidence; it also protects folders used by a manual
+  `media-render` run.
+* **CLI:** `python -m jarvis_ext jobs ...` in the existing argparse CLI;
+  JSON on stdout like the other commands.
+
+**Why not resume interrupted jobs at validation, or match renders to jobs?**
+That needs a job id in the render record (D24). It is optional and was not
+approved for this step; the conservative policy above never duplicates a
+known render, and the remaining window is documented in jobs.md.
+
 ## Assumptions
 
 * Only you (and processes you trust) write to the media workspace. See the

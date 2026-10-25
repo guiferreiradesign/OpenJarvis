@@ -24,10 +24,11 @@ import contextlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, List, Optional
 
@@ -54,8 +55,10 @@ from jarvis_ext.jobs.settings import JobSettings
 logger = logging.getLogger(__name__)
 
 MAX_NOTE_CHARS = 500
+_ID_PREFIX_RE = re.compile(r"^[0-9a-fA-F]{6,32}$")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+MAX_RETRY_DELAY_SECONDS = 86400.0
 # "JRVJ" — marks the file as a JARVIS job database (PRAGMA application_id).
 APPLICATION_ID = 0x4A52564A
 
@@ -99,8 +102,16 @@ _SCHEMA_V1 = (
 )
 
 # Upgrades from version N to N+1, applied in order inside one transaction.
-# Empty until the schema first changes.
-_MIGRATIONS: dict = {}
+# A new database is created at version 1 and upgraded the same way, so the
+# upgrade path is exercised by every test.
+_MIGRATIONS: dict = {
+    # Phase 3 step 3: worker heartbeat (stale-job detection) and retry
+    # back-off (a requeued job is not claimed before not_before).
+    1: (
+        "ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT",
+        "ALTER TABLE jobs ADD COLUMN not_before TEXT",
+    ),
+}
 
 
 class JobStoreError(JobError):
@@ -278,24 +289,28 @@ class JobStore:
         kind_list = None if kinds is None else [validate_kind(k) for k in kinds]
         if kind_list == []:
             return None
-        sql = "SELECT id FROM jobs WHERE status = ? "
-        args: list = [JobStatus.QUEUED.value]
+        sql = (
+            "SELECT id FROM jobs WHERE status = ? "
+            "AND (not_before IS NULL OR not_before <= ?) "
+        )
         if kind_list is not None:
             sql += f"AND kind IN ({', '.join('?' * len(kind_list))}) "
-            args.extend(kind_list)
         sql += "ORDER BY seq LIMIT 1"
         with self._write() as conn:
+            now = self._clock()
+            args: list = [JobStatus.QUEUED.value, now, *(kind_list or [])]
             row = conn.execute(sql, args).fetchone()
             if row is None:
                 return None
             job_id = row["id"]
-            now = self._clock()
             cursor = conn.execute(
                 "UPDATE jobs SET status = ?, claimed_by = ?, attempts = attempts + 1, "
-                "started_at = ?, updated_at = ? WHERE id = ? AND status = ?",
+                "started_at = ?, updated_at = ?, heartbeat_at = ?, not_before = NULL "
+                "WHERE id = ? AND status = ?",
                 (
                     JobStatus.RUNNING.value,
                     worker_id,
+                    now,
                     now,
                     now,
                     job_id,
@@ -349,16 +364,24 @@ class JobStore:
         )
 
     def retry(
-        self, job_id: str, worker_id: str, error_code: str, error_message: str = ""
+        self,
+        job_id: str,
+        worker_id: str,
+        error_code: str,
+        error_message: str = "",
+        *,
+        delay_seconds: float = 0.0,
     ) -> Job:
         """``running`` → ``queued`` after a temporary failure.
 
+        The job is not claimed again for *delay_seconds* (retry back-off).
         Refused when the job has used all its attempts or a cancellation was
         requested; the caller should then :meth:`fail` or
         :meth:`confirm_cancelled` instead.
         """
         code = validate_error_code(error_code)
         message = clean_error_message(error_message)
+        delay = _check_delay(delay_seconds)
         with self._write() as conn:
             job = self._get(conn, job_id)
             self._check_owner(job, worker_id, JobStatus.QUEUED)
@@ -377,10 +400,12 @@ class JobStore:
                 {
                     "claimed_by": None,
                     "started_at": None,
+                    "heartbeat_at": None,
+                    "not_before": self._after(delay),
                     "error_code": code,
                     "error_message": message,
                 },
-                f"retry after {code}",
+                f"retry after {code}" + (f" in {delay:g}s" if delay else ""),
             )
 
     def confirm_cancelled(
@@ -423,6 +448,137 @@ class JobStore:
             now = self._clock()
             conn.execute("UPDATE jobs SET updated_at = ? WHERE id = ?", (now, job_id))
             self._event(conn, job_id, job.status, job.status, note, now)
+
+    def heartbeat(self, job_id: str, worker_id: str) -> Job:
+        """Record that the claiming worker is alive; returns the current job.
+
+        The returned job's ``cancel_requested`` tells the worker whether to
+        stop.  Refused for a job that is not running under *worker_id*.
+        """
+        validate_worker_id(worker_id)
+        with self._write() as conn:
+            job = self._get(conn, job_id)
+            if job.status is not JobStatus.RUNNING or job.claimed_by != worker_id:
+                raise InvalidTransitionError(
+                    "Only the worker running a job can send its heartbeat"
+                )
+            now = self._clock()
+            conn.execute(
+                "UPDATE jobs SET heartbeat_at = ? WHERE id = ? AND status = ?",
+                (now, job_id, JobStatus.RUNNING.value),
+            )
+            return self._get(conn, job_id)
+
+    # -- recovery ------------------------------------------------------------
+
+    def stale_jobs(
+        self, stale_before: str, *, exclude_worker: Optional[str] = None
+    ) -> List[Job]:
+        """Running jobs whose last heartbeat is older than *stale_before*."""
+        sql = (
+            "SELECT * FROM jobs WHERE status = ? "
+            "AND COALESCE(heartbeat_at, started_at, updated_at) < ? "
+        )
+        args: list = [JobStatus.RUNNING.value, stale_before]
+        if exclude_worker is not None:
+            sql += "AND (claimed_by IS NULL OR claimed_by != ?) "
+            args.append(exclude_worker)
+        with self._read() as conn:
+            rows = conn.execute(sql + "ORDER BY seq", args).fetchall()
+        return [_row_to_job(r) for r in rows]
+
+    def recover(
+        self,
+        job_id: str,
+        *,
+        stale_before: str,
+        requeue: bool,
+        error_code: str = "interrupted",
+        error_message: str = "",
+        result: Optional[dict] = None,
+        delay_seconds: float = 0.0,
+    ) -> Job:
+        """Settle a running job whose worker stopped sending heartbeats.
+
+        Re-checked under the write lock: if the job finished or its heartbeat
+        is newer than *stale_before*, nothing changes and
+        :class:`InvalidTransitionError` is raised.  Then, in order:
+
+        * a requested cancellation → ``cancelled``;
+        * *requeue* and attempts left → ``queued`` (after *delay_seconds*);
+        * otherwise → ``failed`` with *error_code*.
+        """
+        code = validate_error_code(error_code)
+        message = clean_error_message(error_message)
+        result_text = _encode_result(result)
+        delay = _check_delay(delay_seconds)
+        with self._write() as conn:
+            job = self._get(conn, job_id)
+            last_seen = job.heartbeat_at or job.started_at or job.updated_at
+            if job.status is not JobStatus.RUNNING or last_seen >= stale_before:
+                raise InvalidTransitionError(
+                    "The job is not running or its worker is still alive"
+                )
+            owner = job.claimed_by or "unknown worker"
+            if job.cancel_requested:
+                return self._apply(
+                    conn,
+                    job,
+                    JobStatus.CANCELLED,
+                    {"finished_at": self._clock(), "result": result_text},
+                    f"recovered from {owner}: cancelled",
+                )
+            if requeue and job.attempts < job.max_attempts:
+                return self._apply(
+                    conn,
+                    job,
+                    JobStatus.QUEUED,
+                    {
+                        "claimed_by": None,
+                        "started_at": None,
+                        "heartbeat_at": None,
+                        "not_before": self._after(delay),
+                        "error_code": code,
+                        "error_message": message,
+                    },
+                    f"recovered from {owner}: requeued after {code}",
+                )
+            return self._apply(
+                conn,
+                job,
+                JobStatus.FAILED,
+                {
+                    "finished_at": self._clock(),
+                    "error_code": code,
+                    "error_message": message,
+                    "result": result_text,
+                },
+                f"recovered from {owner}: {code}",
+            )
+
+    def find(self, id_or_prefix: str) -> Job:
+        """A job by full id or by a unique prefix of at least 6 characters."""
+        if not isinstance(id_or_prefix, str) or not _ID_PREFIX_RE.match(id_or_prefix):
+            raise JobNotFoundError("Give a job id (or at least its first 6 characters)")
+        with self._read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE id LIKE ? ORDER BY seq LIMIT 2",
+                (id_or_prefix.lower() + "%",),
+            ).fetchall()
+        if not rows:
+            raise JobNotFoundError(f"No job with id {id_or_prefix!r}")
+        if len(rows) > 1:
+            raise JobNotFoundError(
+                f"{id_or_prefix!r} matches more than one job; give more characters"
+            )
+        return _row_to_job(rows[0])
+
+    def time_ago(self, seconds: float) -> str:
+        """The store clock's current time minus *seconds*, as stored."""
+        return _shift(self._clock(), -float(seconds))
+
+    def _after(self, seconds: float) -> Optional[str]:
+        return _shift(self._clock(), seconds) if seconds > 0 else None
 
     # -- user operations -----------------------------------------------------
 
@@ -658,6 +814,23 @@ def _wrap(exc: sqlite3.Error) -> JobStoreError:
     return JobStoreError(f"Job database error ({type(exc).__name__})")
 
 
+def _shift(timestamp: str, seconds: float) -> str:
+    moved = datetime.fromisoformat(timestamp) + timedelta(seconds=seconds)
+    return moved.isoformat(timespec="milliseconds")
+
+
+def _check_delay(delay_seconds: Any) -> float:
+    if (
+        isinstance(delay_seconds, bool)
+        or not isinstance(delay_seconds, (int, float))
+        or not 0 <= delay_seconds <= MAX_RETRY_DELAY_SECONDS
+    ):
+        raise InvalidJobError(
+            f"Retry delay must be 0–{MAX_RETRY_DELAY_SECONDS:g} seconds"
+        )
+    return float(delay_seconds)
+
+
 def _encode_result(result: Optional[dict]) -> Optional[str]:
     if result is None:
         return None
@@ -682,6 +855,8 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         updated_at=row["updated_at"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
+        heartbeat_at=row["heartbeat_at"],
+        not_before=row["not_before"],
     )
 
 

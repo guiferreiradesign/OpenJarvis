@@ -22,6 +22,7 @@ import os
 import re
 import signal
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, FrozenSet, List, Mapping, Optional, Sequence
@@ -582,6 +583,62 @@ def run_process(
             raise
 
 
+class ProcessStopped(Exception):
+    """Raised by :func:`run_process_until` after it stopped the process."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"process stopped: {reason}")
+        self.reason = reason
+
+
+def run_process_until(
+    cmd: List[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    log_path: Path,
+    env: Optional[Mapping[str, str]] = None,
+    should_stop: Callable[[], Optional[str]],
+    poll_seconds: float = 0.25,
+) -> int:
+    """Like :func:`run_process`, but also stops early when asked.
+
+    Every *poll_seconds* it calls *should_stop*; a non-empty reason stops the
+    process group exactly as a timeout does (SIGTERM, then SIGKILL, then
+    reaped) and raises :class:`ProcessStopped`.  Used by the job worker to
+    honour cancellation and shutdown; ``run_process`` itself is unchanged.
+    """
+    deadline = time.monotonic() + timeout
+    with open(log_path, "wb") as log:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=log,
+            env=dict(env) if env is not None else minimal_env(),
+            start_new_session=True,
+        )
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _stop(proc)
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                try:
+                    return proc.wait(timeout=min(poll_seconds, remaining))
+                except subprocess.TimeoutExpired:
+                    pass
+                reason = should_stop()
+                if reason:
+                    _stop(proc)
+                    raise ProcessStopped(reason)
+        except BaseException:
+            if proc.poll() is None:
+                _stop(proc)
+            raise
+
+
 def log_tail(log_path: Path, *, redact: Mapping[str, str]) -> str:
     """Last meaningful line(s) of an FFmpeg log, with paths redacted."""
     try:
@@ -611,6 +668,7 @@ __all__ = [
     "LogoInput",
     "PREVIEW_FILENAME",
     "ProcessRunner",
+    "ProcessStopped",
     "RENDER_FILENAME",
     "SUBTITLE_FILENAME",
     "THUMBNAIL_FILENAME",
@@ -627,4 +685,5 @@ __all__ = [
     "png_dimensions",
     "query_capabilities",
     "run_process",
+    "run_process_until",
 ]

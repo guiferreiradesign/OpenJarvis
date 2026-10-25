@@ -49,6 +49,10 @@ output_root = "~/Movies/JARVIS-Renders"
 # A custom path must be absolute and its folder must already exist.
 # database_path = ""
 # max_attempts = 2                   # 1 or 2; retries only temporary failures
+# retry_delay_seconds = 60           # wait before retrying a temporary failure
+# poll_seconds = 2                   # idle worker: how often to look for work
+# heartbeat_seconds = 10             # running job: worker heartbeat interval
+# stale_after_seconds = 120          # no heartbeat this long: worker presumed dead
 
 # Let agents use the tools by default.
 [tools]

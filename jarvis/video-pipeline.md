@@ -434,7 +434,8 @@ suite.
   `Skyline/CLIP.MOV` finds `clip.mov`, and the plan/record keep the spelling
   you used.
 * **Leftover temp folders after a hard kill** (see above) are not cleaned
-  automatically.
+  by the tools themselves. The Phase 3 job worker removes `job-*` folders
+  once they are older than any live call could be (see jobs.md).
 * **Validation needs the render record.** Files not produced by
   `media_render` (or whose `.render.json` was deleted) are reported as
   `no_record` rather than guessed at.

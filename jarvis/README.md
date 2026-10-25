@@ -40,6 +40,7 @@ src/jarvis_ext/            # JARVIS extension package (custom code only)
         store.py           #     SQLite store: submit, claim, finish, retry, cancel
         settings.py        #     [jarvis.jobs] settings
         runner.py          #     run one job: handler outcome -> store transitions
+        worker.py          #     worker loop: lock, heartbeat, recovery, cleanup
     video/                 #   deterministic pipeline used by the tools
         plan.py            #     EditPlan model, presets, timestamp parsing
         settings.py        #     [jarvis.media_render] settings
@@ -73,7 +74,7 @@ The fork touches upstream files in exactly two places:
                 ┌──────────── JARVIS extensions (src/jarvis_ext) ────────────┐
                 │  media_workspace_inspect   (Phase 1, implemented)           │
                 │  media_render / validate   (Phase 2, implemented)           │
-                │  job store + runner (Phase 3 steps 1–2); worker planned     │
+                │  jobs: store, runner, worker + CLI (Phase 3 steps 1–3)      │
                 └─────────────────────────────────────────────────────────────┘
    later:  Mac worker (Phase 4)  ◄── secure channel ──►  cloud orchestrator (Phase 5)
 ```

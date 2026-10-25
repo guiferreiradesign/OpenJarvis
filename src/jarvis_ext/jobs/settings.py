@@ -3,8 +3,12 @@
 ::
 
     [jarvis.jobs]
-    database_path = ""   # default: <OPENJARVIS_HOME>/jarvis/jobs.db
-    max_attempts = 2     # 1 or 2 (DECISIONS.md D23)
+    database_path = ""          # default: <OPENJARVIS_HOME>/jarvis/jobs.db
+    max_attempts = 2            # 1 or 2 (DECISIONS.md D23)
+    retry_delay_seconds = 60    # back-off before a temporary failure is retried
+    poll_seconds = 2            # idle worker: how often to look for work
+    heartbeat_seconds = 10      # running job: how often the worker reports in
+    stale_after_seconds = 120   # no heartbeat for this long: worker presumed dead
 
 The database holds job payloads (for video jobs, edit plans with workspace
 paths), so it is kept with OpenJarvis' own state rather than in a media or
@@ -13,9 +17,10 @@ output folder, and is created readable only by you.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from jarvis_ext.config import ExtensionConfigError, load_extension_section
 from jarvis_ext.jobs.models import MAX_ATTEMPTS
@@ -23,6 +28,15 @@ from jarvis_ext.jobs.models import MAX_ATTEMPTS
 CONFIG_SECTION = "jobs"
 DEFAULT_SUBDIR = "jarvis"
 DEFAULT_FILENAME = "jobs.db"
+LOCK_SUFFIX = ".worker.lock"
+
+# (default, minimum, maximum) for the worker's timing settings.
+TIMINGS: Dict[str, Tuple[float, float, float]] = {
+    "retry_delay_seconds": (60.0, 0.0, 3600.0),
+    "poll_seconds": (2.0, 0.1, 60.0),
+    "heartbeat_seconds": (10.0, 0.05, 300.0),
+    "stale_after_seconds": (120.0, 1.0, 86400.0),
+}
 
 
 def default_database_path() -> Path:
@@ -37,10 +51,14 @@ class JobSettings:
 
     database_path: Optional[Path] = None  # None: default_database_path()
     max_attempts: int = MAX_ATTEMPTS
+    retry_delay_seconds: float = 60.0
+    poll_seconds: float = 2.0
+    heartbeat_seconds: float = 10.0
+    stale_after_seconds: float = 120.0
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "JobSettings":
-        unknown = sorted(set(section) - {"database_path", "max_attempts"})
+        unknown = sorted(set(section) - {"database_path", "max_attempts", *TIMINGS})
         if unknown:
             raise ExtensionConfigError(
                 f"Unknown [jarvis.{CONFIG_SECTION}] keys: {', '.join(unknown)}"
@@ -59,7 +77,25 @@ class JobSettings:
             raise ExtensionConfigError(
                 f"jobs.max_attempts must be an integer between 1 and {MAX_ATTEMPTS}"
             )
-        return cls(database_path=database_path, max_attempts=attempts)
+        timings = {}
+        for key, (default, low, high) in TIMINGS.items():
+            raw = section.get(key, default)
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, (int, float))
+                or not math.isfinite(raw)
+                or not low <= raw <= high
+            ):
+                raise ExtensionConfigError(
+                    f"jobs.{key} must be a number between {low:g} and {high:g}"
+                )
+            timings[key] = float(raw)
+        # A live worker must never look dead: allow three missed heartbeats.
+        if timings["stale_after_seconds"] < 3 * timings["heartbeat_seconds"]:
+            raise ExtensionConfigError(
+                "jobs.stale_after_seconds must be at least 3 × heartbeat_seconds"
+            )
+        return cls(database_path=database_path, max_attempts=attempts, **timings)
 
     @classmethod
     def load(cls, config_path: Optional[Path] = None) -> "JobSettings":
@@ -71,6 +107,11 @@ class JobSettings:
 
     def database_file(self) -> Path:
         return self.database_path or default_database_path()
+
+    def lock_file(self) -> Path:
+        """The worker's single-instance lock, next to the database."""
+        db = self.database_file()
+        return db.with_name(db.name + LOCK_SUFFIX)
 
 
 def _validate_path(raw: str) -> Path:

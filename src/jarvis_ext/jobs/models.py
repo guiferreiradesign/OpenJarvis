@@ -179,6 +179,8 @@ class Job:
     updated_at: str
     started_at: Optional[str]
     finished_at: Optional[str]
+    heartbeat_at: Optional[str] = None
+    not_before: Optional[str] = None
 
     @property
     def is_final(self) -> bool:
@@ -202,6 +204,8 @@ class Job:
             "updated_at": self.updated_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "heartbeat_at": self.heartbeat_at,
+            "not_before": self.not_before,
         }
 
 
