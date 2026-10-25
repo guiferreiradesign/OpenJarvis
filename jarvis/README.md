@@ -10,6 +10,7 @@ untouched.
 | [AUDIT.md](AUDIT.md) | What OpenJarvis actually provides (from reading the source), what is missing, and the Claude authentication findings |
 | [media-workspace.md](media-workspace.md) | The first JARVIS capability: read-only media-workspace inspection |
 | [video-pipeline.md](video-pipeline.md) | Phase 2: `EditPlan`, `media_render`, `media_validate`, output versioning and safety |
+| [jobs.md](jobs.md) | Phase 3: job store, status rules and what is still planned |
 | [examples/edit-plan.example.json](examples/edit-plan.example.json) | A complete example edit plan |
 | [DECISIONS.md](DECISIONS.md) | Architecture decisions and assumptions |
 | [ROADMAP.md](ROADMAP.md) | Phases 1–8 and the checklist of things to verify on the Mac |
@@ -34,6 +35,10 @@ src/jarvis_ext/            # JARVIS extension package (custom code only)
         _video_base.py     #   config/FFmpeg plumbing shared by render/validate
         media_render.py    #   media_render tool
         media_validate.py  #   media_validate tool
+    jobs/                  #   job store shared by all skills (Phase 3)
+        models.py          #     Job, statuses, allowed transitions, validation
+        store.py           #     SQLite store: submit, claim, finish, retry, cancel
+        settings.py        #     [jarvis.jobs] settings
     video/                 #   deterministic pipeline used by the tools
         plan.py            #     EditPlan model, presets, timestamp parsing
         settings.py        #     [jarvis.media_render] settings
@@ -66,7 +71,7 @@ The fork touches upstream files in exactly two places:
                 ┌──────────── JARVIS extensions (src/jarvis_ext) ────────────┐
                 │  media_workspace_inspect   (Phase 1, implemented)           │
                 │  media_render / validate   (Phase 2, implemented)           │
-                │  job status, notifications (Phase 3, planned)               │
+                │  job store (Phase 3 step 1); worker, notifications planned  │
                 └─────────────────────────────────────────────────────────────┘
    later:  Mac worker (Phase 4)  ◄── secure channel ──►  cloud orchestrator (Phase 5)
 ```

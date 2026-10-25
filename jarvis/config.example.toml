@@ -43,6 +43,13 @@ output_root = "~/Movies/JARVIS-Renders"
 # frame_rate = 30
 # max_duration_seconds = 60
 
+[jarvis.jobs]
+# Optional (Phase 3). Where the job database lives. Default:
+# <OPENJARVIS_HOME>/jarvis/jobs.db (normally ~/.openjarvis/jarvis/jobs.db).
+# A custom path must be absolute and its folder must already exist.
+# database_path = ""
+# max_attempts = 2                   # 1 or 2; retries only temporary failures
+
 # Let agents use the tools by default.
 [tools]
 enabled = "media_workspace_inspect,media_render,media_validate,think"

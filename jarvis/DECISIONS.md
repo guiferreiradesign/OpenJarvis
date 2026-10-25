@@ -1,6 +1,6 @@
 # Architecture decisions
 
-Short records of decisions made during Phases 1 and 2, so they can be revisited
+Short records of decisions made during Phases 1–3, so they can be revisited
 deliberately rather than by accident.
 
 ## D1. Custom code goes in a separate `jarvis_ext` package
@@ -169,6 +169,123 @@ natural skin tones where the clipping intent blows out highlights, and that
 so the option is set inline. Regression tests check the generated command
 and real pixel values (full-range black/white become 16/235). HLG was
 verified on one real clip by eye; PQ only through the generated command.
+
+## D19. Jobs run in a dedicated worker, not the upstream scheduler (Phase 3, approved)
+
+**Decision:** long-running work is stored as jobs in a JARVIS SQLite store
+(following the `scheduler/store.py` pattern) and executed by a dedicated
+worker (Phase 3 step 3). `openjarvis.scheduler` is not used to run jobs.
+
+**Why:** the upstream scheduler executes LLM prompts through
+`JarvisSystem.ask`, polls every 60 s, runs tasks one after another in its
+poll thread, and has no cancellation, stages or ownership. Deterministic
+renders need none of the LLM path and all of the missing parts. The
+roadmap's original "reuse `scheduler/`" line is superseded.
+
+## D20. One active job at a time (Phase 3, approved)
+
+**Decision:** the worker runs one job at a time. Parallel execution can be
+added later as a setting.
+
+**Why:** a render uses all CPU cores; two at once are slower in total and
+harder to reason about. The store itself already supports concurrent
+claimers safely (D26), so this is a worker policy, not a storage limit.
+
+## D21. Notifications are local: macOS notifications and logging (Phase 3, approved)
+
+**Decision:** final job states will be reported through the log and macOS
+notifications (step 5). No paid service, external account or network
+dependency. Channels such as Slack or Telegram are left for Phase 6.
+
+## D22. Revisions are complete new plans, as child jobs (Phase 3, approved)
+
+**Decision:** a revision is a new job with `parent_id` set and a complete
+replacement payload (for video, a full `EditPlan`). JSON Merge Patch and
+other partial edits are deferred until the basic flow works. Finished jobs
+are never reopened, and a revision produces a new output version; earlier
+outputs are kept (Phase 2 versioning already guarantees no overwrite).
+
+## D23. At most two attempts, only for temporary failures (Phase 3, approved)
+
+**Decision:** a job may run at most twice. Only failures the runner
+explicitly classifies as temporary are retried; permanent failures,
+validation failures and timeouts are not. `[jarvis.jobs] max_attempts`
+may lower the limit to 1.
+
+**How it is enforced:** the store refuses `retry` once
+`attempts >= max_attempts` or after a cancellation request, so a runner
+bug cannot cause a retry loop. Classification is the runner's job
+(step 2), using the existing `render_status` / `validation_status` values.
+
+## D24. Phase 2 integration changes are optional and later (Phase 3, approved)
+
+**Decision:** a `job_id` in the render record and FFmpeg progress reporting
+may be added in later steps as small, backward-compatible options. When
+they are not used, rendering behaves exactly as in Phase 2. Step 1 does not
+touch the Phase 2 pipeline.
+
+## D25. The job core is skill-neutral: a `kind` plus an opaque JSON payload
+
+**Decision:** a job has a dotted `kind` (`video.render` first; later for
+example `research.report`) and a JSON object `payload` that only the
+runner for that kind interprets. Results are a JSON object too. Status
+names are generic (`succeeded`, not `ready_for_review`); skill-specific
+meaning goes in the result. Workers claim only the kinds they handle.
+
+**Why:** JARVIS will gain other long-running skills. Keeping FFmpeg, video
+paths, HyperFrames and notification details out of `jarvis_ext/jobs`
+means a new skill adds a runner, not a new store. No plugin system or
+workflow engine is built until a second kind actually exists.
+
+## D26. Job store integrity: write lock, guarded transitions, identified schema
+
+**Decision:**
+
+* Every write is a `BEGIN IMMEDIATE` transaction. The status is read,
+  checked against the transition table, and updated (conditional on the
+  status that was read) while holding SQLite's write lock. Claiming is
+  therefore atomic across threads and processes (tested with 8 threads and
+  4 processes).
+* Only the worker that claimed a job may finish, fail, retry or confirm
+  cancelling it.
+* Every status change is appended to `job_events` in the same transaction.
+* The file is marked with `PRAGMA application_id` and the schema version
+  with `PRAGMA user_version`. A newer version, a foreign SQLite file or a
+  non-database file is refused **before** anything is written (the check
+  runs before switching to WAL). Upgrades will be explicit, numbered
+  migrations.
+* WAL journal mode, so status reads do not block the worker.
+* The database is created with mode 0600 in `<OPENJARVIS_HOME>/jarvis/`
+  (folder 0700), because payloads contain workspace paths. A custom
+  `database_path` must be in an existing folder (as for `output_root`,
+  D11) and must not be a symlink.
+* Error messages never include the database path (D3).
+
+**Not yet handled (step 3):** a job left `running` by a worker that died.
+Recovery needs a heartbeat, which arrives with the worker.
+
+## D27. Cancellation is a request; the real outcome wins (Phase 3, approved)
+
+**Decision:**
+
+* A **queued** job is cancelled immediately (`queued` → `cancelled`).
+* Cancelling a **running** job only sets `cancel_requested`. The job stays
+  `running` until its worker has stopped the work safely and calls
+  `confirm_cancelled`, which is refused unless a cancellation was requested.
+* If the work **succeeds or fails before the cancellation takes effect**,
+  the job records that actual outcome (`succeeded` / `failed`), never a
+  false `cancelled`. A cancellation request also blocks `retry`.
+* The worker (step 3) must ensure a cancelled render never publishes
+  partial output as a completed render. Phase 2 already gives the needed
+  property: a render is produced in a private temp directory and only
+  receives its final name after its checks pass (D12), and an interrupted
+  render has its FFmpeg process stopped and temp directory removed. The
+  worker must stop FFmpeg before publishing, then confirm the cancellation.
+
+**Why:** reporting `cancelled` for a file that was in fact published, or
+`succeeded` for work that was stopped halfway, would make the job history
+untrustworthy. Implemented in step 1 (store rules, tested); the worker
+side is step 3.
 
 ## Assumptions
 

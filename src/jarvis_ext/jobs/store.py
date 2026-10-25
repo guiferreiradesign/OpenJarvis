@@ -1,0 +1,681 @@
+"""SQLite persistence for jobs, following the ``scheduler/store.py`` pattern.
+
+Differences from the upstream scheduler store, all deliberate:
+
+* Every write runs in a ``BEGIN IMMEDIATE`` transaction, so a status change
+  is checked and applied under the database's write lock.  Claiming is
+  therefore atomic across threads *and* processes: two workers can never
+  claim the same job.
+* Status changes go through :func:`~jarvis_ext.jobs.models.check_transition`
+  and are conditional on the state that was checked, and every change is
+  appended to ``job_events`` in the same transaction.
+* The file carries an ``application_id`` and a ``user_version`` (the schema
+  version).  A file from a newer JARVIS, or a SQLite file that is not a job
+  database, is refused without being modified.
+* WAL journal mode, so readers (status queries) do not block the worker.
+
+Error messages never contain the database path; they can reach a model
+through tool results (see DECISIONS.md D3).
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import os
+import sqlite3
+import threading
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator, List, Optional
+
+from jarvis_ext.jobs.models import (
+    MAX_ATTEMPTS,
+    MAX_PAYLOAD_BYTES,
+    MAX_RESULT_BYTES,
+    InvalidJobError,
+    InvalidTransitionError,
+    Job,
+    JobError,
+    JobEvent,
+    JobNotFoundError,
+    JobStatus,
+    check_transition,
+    clean_error_message,
+    encode_json_object,
+    validate_error_code,
+    validate_kind,
+    validate_worker_id,
+)
+from jarvis_ext.jobs.settings import JobSettings
+
+logger = logging.getLogger(__name__)
+
+SCHEMA_VERSION = 1
+# "JRVJ" — marks the file as a JARVIS job database (PRAGMA application_id).
+APPLICATION_ID = 0x4A52564A
+
+_STATUS_VALUES = ", ".join(f"'{s.value}'" for s in JobStatus)
+
+_SCHEMA_V1 = (
+    f"""
+    CREATE TABLE jobs (
+        seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+        id               TEXT    NOT NULL UNIQUE,
+        kind             TEXT    NOT NULL,
+        status           TEXT    NOT NULL CHECK (status IN ({_STATUS_VALUES})),
+        payload          TEXT    NOT NULL,
+        parent_id        TEXT    REFERENCES jobs(id),
+        attempts         INTEGER NOT NULL DEFAULT 0,
+        max_attempts     INTEGER NOT NULL CHECK (max_attempts >= 1),
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
+        claimed_by       TEXT,
+        result           TEXT,
+        error_code       TEXT,
+        error_message    TEXT,
+        created_at       TEXT    NOT NULL,
+        updated_at       TEXT    NOT NULL,
+        started_at       TEXT,
+        finished_at      TEXT
+    )
+    """,
+    "CREATE INDEX jobs_status_seq ON jobs (status, seq)",
+    "CREATE INDEX jobs_parent ON jobs (parent_id)",
+    """
+    CREATE TABLE job_events (
+        seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id      TEXT NOT NULL REFERENCES jobs(id),
+        at          TEXT NOT NULL,
+        from_status TEXT,
+        to_status   TEXT NOT NULL,
+        note        TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    "CREATE INDEX job_events_job ON job_events (job_id, seq)",
+)
+
+# Upgrades from version N to N+1, applied in order inside one transaction.
+# Empty until the schema first changes.
+_MIGRATIONS: dict = {}
+
+
+class JobStoreError(JobError):
+    """The job database cannot be opened or used."""
+
+
+class SchemaVersionError(JobStoreError):
+    """The database was written by a different (usually newer) schema."""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+class JobStore:
+    """SQLite-backed job store.
+
+    One instance holds one connection and may be shared between threads.
+    Separate instances (or processes) may open the same file concurrently.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        default_max_attempts: int = MAX_ATTEMPTS,
+        busy_timeout_seconds: float = 10.0,
+        clock: Callable[[], str] = _now,
+    ) -> None:
+        if not 1 <= default_max_attempts <= MAX_ATTEMPTS:
+            raise ValueError(f"default_max_attempts must be 1–{MAX_ATTEMPTS}")
+        self._default_max_attempts = default_max_attempts
+        self._clock = clock
+        self._lock = threading.RLock()
+        path = Path(path)
+        _prepare_file(path)
+        try:
+            self._conn = sqlite3.connect(
+                str(path),
+                timeout=busy_timeout_seconds,
+                isolation_level=None,  # transactions are managed explicitly
+                check_same_thread=False,
+            )
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                f"Cannot open the job database ({type(exc).__name__})"
+            ) from None
+        self._conn.row_factory = sqlite3.Row
+        try:
+            self._initialise()
+        except BaseException:
+            self._conn.close()
+            raise
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def __enter__(self) -> "JobStore":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    @property
+    def journal_mode(self) -> str:
+        return self._read_one("PRAGMA journal_mode")[0]
+
+    @property
+    def schema_version(self) -> int:
+        return self._read_one("PRAGMA user_version")[0]
+
+    # -- submitting and reading ---------------------------------------------
+
+    def submit(
+        self,
+        kind: str,
+        payload: dict,
+        *,
+        parent_id: Optional[str] = None,
+        max_attempts: Optional[int] = None,
+    ) -> Job:
+        """Queue a new job and return it."""
+        validate_kind(kind)
+        payload_text = encode_json_object(payload, "payload", MAX_PAYLOAD_BYTES)
+        if max_attempts is None:
+            max_attempts = self._default_max_attempts
+        if (
+            isinstance(max_attempts, bool)
+            or not isinstance(max_attempts, int)
+            or not 1 <= max_attempts <= MAX_ATTEMPTS
+        ):
+            raise InvalidJobError(f"max_attempts must be 1–{MAX_ATTEMPTS}")
+        job_id = uuid.uuid4().hex
+        with self._write() as conn:
+            if parent_id is not None and self._fetch(conn, parent_id) is None:
+                raise JobNotFoundError(f"Parent job {parent_id!r} does not exist")
+            now = self._clock()
+            conn.execute(
+                "INSERT INTO jobs (id, kind, status, payload, parent_id, "
+                "max_attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    kind,
+                    JobStatus.QUEUED.value,
+                    payload_text,
+                    parent_id,
+                    max_attempts,
+                    now,
+                    now,
+                ),
+            )
+            self._event(conn, job_id, None, JobStatus.QUEUED, "submitted", now)
+            return self._get(conn, job_id)
+
+    def get(self, job_id: str) -> Job:
+        with self._read() as conn:
+            return self._get(conn, job_id)
+
+    def list_jobs(
+        self,
+        *,
+        status: Optional[JobStatus] = None,
+        kind: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Job]:
+        """Most recent jobs first, optionally filtered."""
+        clauses, args = [], []
+        if status is not None:
+            clauses.append("status = ?")
+            args.append(JobStatus(status).value)
+        if kind is not None:
+            clauses.append("kind = ?")
+            args.append(validate_kind(kind))
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        with self._read() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM jobs {where}ORDER BY seq DESC LIMIT ?",
+                (*args, max(0, int(limit))),
+            ).fetchall()
+        return [_row_to_job(r) for r in rows]
+
+    def events(self, job_id: str) -> List[JobEvent]:
+        """A job's status history, oldest first."""
+        with self._read() as conn:
+            self._get(conn, job_id)
+            rows = conn.execute(
+                "SELECT * FROM job_events WHERE job_id = ? ORDER BY seq", (job_id,)
+            ).fetchall()
+        return [
+            JobEvent(
+                job_id=r["job_id"],
+                at=r["at"],
+                from_status=JobStatus(r["from_status"]) if r["from_status"] else None,
+                to_status=JobStatus(r["to_status"]),
+                note=r["note"],
+            )
+            for r in rows
+        ]
+
+    # -- worker operations ---------------------------------------------------
+
+    def claim_next(
+        self, worker_id: str, *, kinds: Optional[Iterable[str]] = None
+    ) -> Optional[Job]:
+        """Atomically move the oldest queued job (of *kinds*) to ``running``.
+
+        Returns ``None`` when nothing is queued.  The check and the update
+        happen under the database write lock, so concurrent claimers in any
+        thread or process always receive different jobs.
+        """
+        validate_worker_id(worker_id)
+        kind_list = None if kinds is None else [validate_kind(k) for k in kinds]
+        if kind_list == []:
+            return None
+        sql = "SELECT id FROM jobs WHERE status = ? "
+        args: list = [JobStatus.QUEUED.value]
+        if kind_list is not None:
+            sql += f"AND kind IN ({', '.join('?' * len(kind_list))}) "
+            args.extend(kind_list)
+        sql += "ORDER BY seq LIMIT 1"
+        with self._write() as conn:
+            row = conn.execute(sql, args).fetchone()
+            if row is None:
+                return None
+            job_id = row["id"]
+            now = self._clock()
+            cursor = conn.execute(
+                "UPDATE jobs SET status = ?, claimed_by = ?, attempts = attempts + 1, "
+                "started_at = ?, updated_at = ? WHERE id = ? AND status = ?",
+                (
+                    JobStatus.RUNNING.value,
+                    worker_id,
+                    now,
+                    now,
+                    job_id,
+                    JobStatus.QUEUED.value,
+                ),
+            )
+            if cursor.rowcount != 1:  # pragma: no cover - guarded by the write lock
+                raise JobStoreError("The job was claimed concurrently; try again")
+            self._event(
+                conn,
+                job_id,
+                JobStatus.QUEUED,
+                JobStatus.RUNNING,
+                f"claimed by {worker_id}",
+                now,
+            )
+            return self._get(conn, job_id)
+
+    def complete(
+        self, job_id: str, worker_id: str, result: Optional[dict] = None
+    ) -> Job:
+        """``running`` → ``succeeded``, storing the runner's result."""
+        result_text = (
+            None
+            if result is None
+            else encode_json_object(result, "result", MAX_RESULT_BYTES)
+        )
+        return self._finish_running(
+            job_id,
+            worker_id,
+            JobStatus.SUCCEEDED,
+            {"result": result_text},
+            "succeeded",
+        )
+
+    def fail(
+        self, job_id: str, worker_id: str, error_code: str, error_message: str = ""
+    ) -> Job:
+        """``running`` → ``failed`` (final)."""
+        code = validate_error_code(error_code)
+        return self._finish_running(
+            job_id,
+            worker_id,
+            JobStatus.FAILED,
+            {"error_code": code, "error_message": clean_error_message(error_message)},
+            code,
+        )
+
+    def retry(
+        self, job_id: str, worker_id: str, error_code: str, error_message: str = ""
+    ) -> Job:
+        """``running`` → ``queued`` after a temporary failure.
+
+        Refused when the job has used all its attempts or a cancellation was
+        requested; the caller should then :meth:`fail` or
+        :meth:`confirm_cancelled` instead.
+        """
+        code = validate_error_code(error_code)
+        message = clean_error_message(error_message)
+        with self._write() as conn:
+            job = self._get(conn, job_id)
+            self._check_owner(job, worker_id, JobStatus.QUEUED)
+            if job.cancel_requested:
+                raise InvalidTransitionError(
+                    "Cancellation was requested; the job cannot be retried"
+                )
+            if job.attempts >= job.max_attempts:
+                raise InvalidTransitionError(
+                    f"The job has used all {job.max_attempts} attempt(s)"
+                )
+            return self._apply(
+                conn,
+                job,
+                JobStatus.QUEUED,
+                {
+                    "claimed_by": None,
+                    "started_at": None,
+                    "error_code": code,
+                    "error_message": message,
+                },
+                f"retry after {code}",
+            )
+
+    def confirm_cancelled(self, job_id: str, worker_id: str) -> Job:
+        """``running`` → ``cancelled`` once the worker has stopped the work."""
+        with self._write() as conn:
+            job = self._get(conn, job_id)
+            self._check_owner(job, worker_id, JobStatus.CANCELLED)
+            if not job.cancel_requested:
+                raise InvalidTransitionError("No cancellation was requested")
+            return self._apply(
+                conn,
+                job,
+                JobStatus.CANCELLED,
+                {"finished_at": self._clock()},
+                "cancelled by worker",
+            )
+
+    # -- user operations -----------------------------------------------------
+
+    def cancel(self, job_id: str) -> Job:
+        """Cancel a job.
+
+        A queued job becomes ``cancelled`` at once.  A running job keeps
+        running with ``cancel_requested`` set until its worker stops and calls
+        :meth:`confirm_cancelled`.  Final jobs cannot be cancelled.
+        """
+        with self._write() as conn:
+            job = self._get(conn, job_id)
+            if job.status is JobStatus.QUEUED:
+                return self._apply(
+                    conn,
+                    job,
+                    JobStatus.CANCELLED,
+                    {"cancel_requested": 1, "finished_at": self._clock()},
+                    "cancelled while queued",
+                )
+            check_transition(job.status, JobStatus.CANCELLED)
+            if job.cancel_requested:
+                return job
+            now = self._clock()
+            conn.execute(
+                "UPDATE jobs SET cancel_requested = 1, updated_at = ? "
+                "WHERE id = ? AND status = ?",
+                (now, job_id, job.status.value),
+            )
+            self._event(
+                conn, job_id, job.status, job.status, "cancellation requested", now
+            )
+            return self._get(conn, job_id)
+
+    # -- internals -----------------------------------------------------------
+
+    def _finish_running(
+        self,
+        job_id: str,
+        worker_id: str,
+        target: JobStatus,
+        fields: dict,
+        note: str,
+    ) -> Job:
+        with self._write() as conn:
+            job = self._get(conn, job_id)
+            self._check_owner(job, worker_id, target)
+            return self._apply(
+                conn, job, target, {**fields, "finished_at": self._clock()}, note
+            )
+
+    @staticmethod
+    def _check_owner(job: Job, worker_id: str, target: JobStatus) -> None:
+        validate_worker_id(worker_id)
+        check_transition(job.status, target)
+        if job.claimed_by != worker_id:
+            raise InvalidTransitionError("The job is claimed by a different worker")
+
+    def _apply(
+        self,
+        conn: sqlite3.Connection,
+        job: Job,
+        target: JobStatus,
+        fields: dict,
+        note: str,
+    ) -> Job:
+        """Change status from the state that was checked, and log it."""
+        check_transition(job.status, target)
+        now = self._clock()
+        assignments = {"status": target.value, "updated_at": now, **fields}
+        columns = ", ".join(f"{name} = ?" for name in assignments)
+        cursor = conn.execute(
+            f"UPDATE jobs SET {columns} WHERE id = ? AND status = ?",
+            (*assignments.values(), job.id, job.status.value),
+        )
+        if cursor.rowcount != 1:  # pragma: no cover - guarded by the write lock
+            raise InvalidTransitionError("The job changed during the update")
+        self._event(conn, job.id, job.status, target, note, now)
+        return self._get(conn, job.id)
+
+    @staticmethod
+    def _event(
+        conn: sqlite3.Connection,
+        job_id: str,
+        from_status: Optional[JobStatus],
+        to_status: JobStatus,
+        note: str,
+        at: str,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO job_events (job_id, at, from_status, to_status, note) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                job_id,
+                at,
+                from_status.value if from_status else None,
+                to_status.value,
+                note,
+            ),
+        )
+
+    @staticmethod
+    def _fetch(conn: sqlite3.Connection, job_id: Any) -> Optional[sqlite3.Row]:
+        if not isinstance(job_id, str):
+            return None
+        return conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+
+    def _get(self, conn: sqlite3.Connection, job_id: Any) -> Job:
+        row = self._fetch(conn, job_id)
+        if row is None:
+            raise JobNotFoundError(f"No job with id {job_id!r}")
+        return _row_to_job(row)
+
+    @contextlib.contextmanager
+    def _write(self) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.Error as exc:
+                raise _wrap(exc) from None
+            try:
+                yield self._conn
+            except BaseException as exc:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.execute("ROLLBACK")
+                if isinstance(exc, sqlite3.Error):
+                    raise _wrap(exc) from None
+                raise
+            else:
+                try:
+                    self._conn.execute("COMMIT")
+                except sqlite3.Error as exc:
+                    with contextlib.suppress(sqlite3.Error):
+                        self._conn.execute("ROLLBACK")
+                    raise _wrap(exc) from None
+
+    @contextlib.contextmanager
+    def _read(self) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            try:
+                yield self._conn
+            except sqlite3.Error as exc:
+                raise _wrap(exc) from None
+
+    def _read_one(self, sql: str) -> tuple:
+        with self._read() as conn:
+            return tuple(conn.execute(sql).fetchone())
+
+    def _initialise(self) -> None:
+        conn = self._conn
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            # Identify the file before changing anything about it.
+            _check_identity(conn)
+            # WAL lets status reads proceed while a worker writes.  Some
+            # filesystems (network shares) cannot do WAL; SQLite then keeps
+            # its rollback journal, which is still correct, only slower.
+            mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+        except sqlite3.DatabaseError:
+            raise JobStoreError("The file is not a JARVIS job database") from None
+        if str(mode).lower() != "wal":
+            logger.warning("Job database is using journal mode %s, not WAL", mode)
+        with self._write() as conn:
+            # Checked again under the write lock: another process may have
+            # created the schema since the first check.
+            version = _check_identity(conn)
+            if version == 0:
+                for statement in _SCHEMA_V1:
+                    conn.execute(statement)
+                version = 1
+            while version < SCHEMA_VERSION:
+                if version not in _MIGRATIONS:  # pragma: no cover - none yet
+                    raise SchemaVersionError(
+                        f"No upgrade path from job schema version {version}"
+                    )
+                for statement in _MIGRATIONS[version]:
+                    conn.execute(statement)
+                version += 1
+            # PRAGMA does not accept bound parameters; both values are ints.
+            conn.execute(f"PRAGMA application_id = {int(APPLICATION_ID)}")
+            conn.execute(f"PRAGMA user_version = {int(version)}")
+
+
+def _check_identity(conn: sqlite3.Connection) -> int:
+    """Return the schema version, refusing foreign or newer databases."""
+    app_id = conn.execute("PRAGMA application_id").fetchone()[0]
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if app_id not in (0, APPLICATION_ID) or (
+        app_id == 0 and (version != 0 or _has_tables(conn))
+    ):
+        raise JobStoreError("The file is not a JARVIS job database")
+    if version > SCHEMA_VERSION:
+        raise SchemaVersionError(
+            f"The job database uses schema version {version}, but this "
+            f"JARVIS supports up to {SCHEMA_VERSION}. Update JARVIS; the "
+            "database was not changed."
+        )
+    return version
+
+
+def _prepare_file(path: Path) -> None:
+    """Refuse odd targets and create a new database file readable only by you."""
+    try:
+        if path.is_symlink():
+            raise JobStoreError("The job database path must not be a symbolic link")
+        if path.exists() and not path.is_file():
+            raise JobStoreError("The job database path is not a regular file")
+        if not path.parent.is_dir():
+            raise JobStoreError("The job database folder does not exist")
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return
+        os.close(fd)
+    except OSError as exc:
+        raise JobStoreError(
+            f"Cannot create the job database ({exc.strerror or type(exc).__name__})"
+        ) from None
+
+
+def _has_tables(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1"
+        ).fetchone()
+        is not None
+    )
+
+
+def _wrap(exc: sqlite3.Error) -> JobStoreError:
+    if isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower():
+        return JobStoreError("The job database is busy; try again")
+    return JobStoreError(f"Job database error ({type(exc).__name__})")
+
+
+def _row_to_job(row: sqlite3.Row) -> Job:
+    return Job(
+        id=row["id"],
+        kind=row["kind"],
+        status=JobStatus(row["status"]),
+        payload=json.loads(row["payload"]),
+        parent_id=row["parent_id"],
+        attempts=row["attempts"],
+        max_attempts=row["max_attempts"],
+        cancel_requested=bool(row["cancel_requested"]),
+        claimed_by=row["claimed_by"],
+        result=json.loads(row["result"]) if row["result"] is not None else None,
+        error_code=row["error_code"],
+        error_message=row["error_message"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+    )
+
+
+def open_job_store(
+    settings: Optional[JobSettings] = None, *, config_path: Optional[Path] = None
+) -> JobStore:
+    """Open the store configured in ``[jarvis.jobs]``.
+
+    The default location's ``jarvis/`` folder is created (mode 0700) inside
+    the OpenJarvis home.  A custom ``database_path`` must be in an existing
+    folder, so a path on an unplugged drive fails instead of creating
+    folders under ``/Volumes`` (as for ``output_root``, D11).
+    """
+    if settings is None:
+        settings = JobSettings.load(config_path)
+    path = settings.database_file()
+    if settings.uses_default_path:
+        try:
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except OSError as exc:
+            raise JobStoreError(
+                "Cannot create the job database folder "
+                f"({exc.strerror or type(exc).__name__})"
+            ) from None
+    return JobStore(path, default_max_attempts=settings.max_attempts)
+
+
+__all__ = [
+    "APPLICATION_ID",
+    "JobStore",
+    "JobStoreError",
+    "SCHEMA_VERSION",
+    "SchemaVersionError",
+    "open_job_store",
+]
