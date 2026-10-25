@@ -6,18 +6,33 @@ tools exactly as an agent or the CLI would (``media_render``, then
 
 Payload::
 
-    {"plan": { ...an EditPlan object, see video-pipeline.md... }}
+    {"plan": { ...an EditPlan object, see video-pipeline.md... },
+     "reuse": false}      # optional: always render, never reuse
+
+What a job does (D32), in order:
+
+1. **Resume** (later attempts only): if an earlier attempt of this job
+   published a render whose record names this job and whose inputs still
+   match, validate that file instead of rendering again.
+2. **Reuse** (unless ``reuse`` is false): if an earlier succeeded job made
+   a render from provably identical inputs, and its record and checksum
+   still match, validate that file again and succeed with it.
+3. Otherwise **render** (recording this job's id and input checksums in
+   the render record) and validate.
 
 Outcomes (DECISIONS.md D23, D27, D28):
 
-* **succeeded** only when the render succeeded *and* validation passed with
-  ``ready_for_review: true`` for that same file (preview and thumbnail made).
+* **succeeded** only when validation passed with ``ready_for_review: true``
+  for the job's file (preview and thumbnail made), whether it was rendered
+  now, resumed or reused.
 * **retry** for render failures that may pass on a second try
   (:data:`RENDER_RETRYABLE`).  The store still enforces the attempt limit.
 * **failed** for everything else: permanent render failures (including
   ``timeout`` and ``failed_checks``), every validation failure, and any
   report the handler cannot interpret.  Validation failures are never
-  retried, because a retry would render a second version.
+  retried, because a retry would render a second version.  An
+  *interrupted* validation is retried (validation only) when the render
+  record identifies this job; otherwise it fails as before.
 * **cancelled** when a cancellation was requested before rendering, or
   after rendering but before validation.  A render published before the
   cancellation is listed in the result as *not validated*; it is never
@@ -41,7 +56,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from jarvis_ext.jobs.models import Job, JobEvent, JobStatus
+from jarvis_ext.jobs.models import Job, JobError, JobEvent, JobStatus
 from jarvis_ext.jobs.runner import (
     STOP_CANCEL,
     STOP_SHUTDOWN,
@@ -58,7 +73,8 @@ from jarvis_ext.video.ffmpeg import (
     run_process_until,
 )
 from jarvis_ext.video.output import TMP_DIRNAME, OutputFolder
-from jarvis_ext.video.plan import PlanError, parse_timestamp
+from jarvis_ext.video.plan import PlanError, parse_edit_plan, parse_timestamp
+from jarvis_ext.video.provenance import is_digest, mismatch
 from openjarvis.core.types import ToolResult
 
 KIND = "video.render"
@@ -68,6 +84,10 @@ STAGE_VALIDATE = "validate"
 RENDER_STARTED_NOTE = "render started"
 RENDERED_NOTE_PREFIX = "rendered "
 _TEMP_PREFIX = "job-"  # OutputFolder.make_temp_dir's mkdtemp prefix
+# Reuse: how many recent succeeded jobs are looked at, and how many
+# matching outputs are verified at most.
+REUSE_SCAN_LIMIT = 200
+MAX_REUSE_CANDIDATES = 3
 
 logger = logging.getLogger(__name__)
 # The running render's progress callback (set by the handler, read by
@@ -126,6 +146,7 @@ class VideoRenderHandler:
                 config_path=config_path,
                 process_runner=stoppable_run_process,
                 report_progress=True,
+                record_provenance=True,
             )
             validate_tool = validate_tool or MediaValidateTool(
                 config_path=config_path, process_runner=stoppable_run_process
@@ -148,6 +169,20 @@ class VideoRenderHandler:
                 "interrupted", "The worker stopped before rendering started"
             )
 
+        # A later attempt first looks for a render an earlier attempt of
+        # this same job published (the worker stopped before recording or
+        # validating it), then for an identical finished job's output.
+        if context.job.attempts > 1:
+            outcome = self._resume(context, plan)
+            if outcome is not None:
+                return outcome
+        if context.job.payload.get("reuse", True):
+            outcome = self._reuse(context, plan)
+            if outcome is not None:
+                return outcome
+        return self._render_and_validate(context, plan)
+
+    def _render_and_validate(self, context: JobContext, plan: dict) -> JobOutcome:
         context.note(RENDER_STARTED_NOTE)
         context.progress(STAGE_RENDER, 0.0)
         expected = expected_duration(plan)
@@ -157,9 +192,12 @@ class VideoRenderHandler:
                 share = min(seconds / expected, 1.0) * RENDER_SHARE
                 context.progress(STAGE_RENDER, share)
 
+        params: Dict[str, Any] = {"plan": plan}
+        if getattr(self._render, "records_provenance", False) is True:
+            params["provenance"] = {"job_id": context.job.id}
         _render_progress.callback = on_encoded
         try:
-            render = _report(self._render.execute(plan=plan))
+            render = _report(self._render.execute(**params))
         except JobCancelled:
             # FFmpeg was stopped inside the render tool, which then removed
             # its temp folder: nothing was published.
@@ -203,7 +241,36 @@ class VideoRenderHandler:
                 return JobOutcome.retry(code, message, result)
             return JobOutcome.failed(code, message, result)
 
+        provenance = render.get("provenance")
+        resumable = False
+        if (
+            isinstance(provenance, dict)
+            and provenance.get("job_id") == context.job.id
+            and is_digest(provenance.get("plan_digest"))
+        ):
+            result["plan_digest"] = provenance["plan_digest"]
+            result["input_key"] = (
+                provenance["input_key"]
+                if is_digest(provenance.get("input_key"))
+                else None
+            )
+            resumable = result["input_key"] is not None
         context.note(f"{RENDERED_NOTE_PREFIX}{file_name}")
+        return self._finish(context, file_name, result, resumable=resumable)
+
+    def _finish(
+        self,
+        context: JobContext,
+        file_name: str,
+        result: Dict[str, Any],
+        *,
+        resumable: bool,
+    ) -> JobOutcome:
+        """Validate a render this job published, and decide the outcome.
+
+        *resumable*: its record identifies this job and its inputs, so an
+        interrupted validation can be retried without rendering again.
+        """
         context.progress(STAGE_VALIDATE, RENDER_SHARE)
         unvalidated = (
             f"{file_name} was published but not validated; it is not ready for review."
@@ -214,7 +281,7 @@ class VideoRenderHandler:
             result["note"] = unvalidated
             if stop == STOP_CANCEL:
                 return JobOutcome.cancelled(result)
-            return JobOutcome.failed("validate_interrupted", unvalidated, result)
+            return _validation_interrupted(unvalidated, result, resumable)
 
         try:
             validation = _report(self._validate.execute(output=file_name))
@@ -223,19 +290,10 @@ class VideoRenderHandler:
             result["note"] = unvalidated
             if isinstance(exc, JobCancelled):
                 return JobOutcome.cancelled(result)
-            # Not retried: a retry would render a second version.
-            return JobOutcome.failed("validate_interrupted", unvalidated, result)
+            return _validation_interrupted(unvalidated, result, resumable)
         status = validation.get("validation_status")
         result["validate"] = _validate_summary(validation)
-        validated = (
-            validation.get("_success") is True
-            and status == "passed"
-            and validation.get("ready_for_review") is True
-            and validation.get("output") == file_name
-            and isinstance(validation.get("preview"), str)
-            and isinstance(validation.get("thumbnail"), str)
-        )
-        if validated:
+        if _validated(validation, file_name):
             result["ready_for_review"] = True
             context.note(f"validated {file_name}")
             return JobOutcome.succeeded(result)
@@ -245,10 +303,191 @@ class VideoRenderHandler:
                 "media_validate returned an inconsistent report",
                 result,
             )
+        # Never retried: the file failed its checks, and a retry would
+        # render a second version.
         return JobOutcome.failed(
             _code("validate", status),
             _message(validation, "Validation did not pass"),
             result,
+        )
+
+    # -- resuming this job's own render (later attempts) ----------------------
+
+    def _resume(self, context: JobContext, plan: dict) -> Optional[JobOutcome]:
+        """Validate a render an earlier attempt of this job published.
+
+        The render must be identified by its record's provenance (this
+        job's id), not by its name, and must have been made from exactly
+        the inputs this plan resolves to now.  Returns ``None`` to render
+        normally (nothing was published, or what was published no longer
+        matches), or the outcome.
+        """
+        job = context.job
+        rendered = _rendered_names(_events(context))
+        finder = getattr(self._render, "find_job_records", None)
+        fingerprint = getattr(self._render, "fingerprint", None)
+        own = (
+            finder(plan.get("output_name"), job.id)
+            if callable(finder) and callable(fingerprint)
+            else []
+        )
+        if not own:
+            if rendered:
+                # A legacy record, or one that could not be written: the
+                # file cannot be tied to this job, and rendering again
+                # would publish a second version.
+                name = rendered[-1]
+                return JobOutcome.failed(
+                    "validate_interrupted",
+                    f"An earlier attempt published {name}, but its render record "
+                    "does not identify this job, so it is neither validated nor "
+                    "rendered again; it is not ready for review.",
+                    {
+                        "output": name,
+                        "ready_for_review": False,
+                        "stage": "after_render",
+                    },
+                )
+            return None
+        if len(own) > 1:
+            names = ", ".join(entry["file"] for entry in own)
+            return JobOutcome.failed(
+                "resume_ambiguous",
+                f"More than one render ({names}) names this job; none is used "
+                "and nothing is rendered again.",
+                {"output": None, "ready_for_review": False, "stage": "after_render"},
+            )
+        file_name, record = own[0]["file"], own[0]["record"]
+        current = fingerprint(plan)
+        key = current.get("input_key") if current.get("status") == "ok" else None
+        reason = mismatch(record, job_id=job.id, input_key=key)
+        if reason is not None:
+            context.note(f"not resuming {file_name}: {reason}")
+            return None
+        context.note(f"resuming {file_name}: published by an earlier attempt")
+        result: Dict[str, Any] = {
+            "output": file_name,
+            "ready_for_review": False,
+            "render": _record_summary(file_name, record),
+            "validate": None,
+            "resumed": True,
+            "plan_digest": current["plan_digest"],
+            "input_key": key,
+        }
+        return self._finish(context, file_name, result, resumable=True)
+
+    # -- reusing an identical finished job's output ---------------------------
+
+    def _reuse(self, context: JobContext, plan: dict) -> Optional[JobOutcome]:
+        """Succeed with an earlier job's output if it is provably identical.
+
+        Candidates are succeeded ``video.render`` jobs whose result has the
+        same plan digest.  One is used only if this plan's input key (plan,
+        preset, FFmpeg, command, source/subtitle/logo checksums, computed
+        now) equals the candidate's, its render record on disk names the
+        job that published it with that key and checksum, and
+        ``media_validate`` passes on it again (checksum, probe, full decode,
+        fresh preview and thumbnail).  Returns ``None`` to render instead.
+        """
+        digest_of = getattr(self._render, "plan_digest", None)
+        fingerprint = getattr(self._render, "fingerprint", None)
+        read_record = getattr(self._render, "read_record", None)
+        if not (
+            callable(digest_of) and callable(fingerprint) and callable(read_record)
+        ):
+            return None
+        digest = digest_of(plan)
+        if not is_digest(digest):
+            return None
+        try:
+            earlier = context.store.list_jobs(
+                status=JobStatus.SUCCEEDED, kind=KIND, limit=REUSE_SCAN_LIMIT
+            )
+        except JobError as exc:
+            logger.warning("Reuse check for job %s skipped: %s", context.job.id, exc)
+            return None
+        candidates = [
+            job
+            for job in earlier
+            if job.id != context.job.id and _reusable_result(job.result, digest)
+        ]
+        if not candidates:
+            return None
+        current = fingerprint(plan)
+        if current.get("status") != "ok" or not is_digest(current.get("input_key")):
+            return None  # the render reports the real problem
+        key = current["input_key"]
+        checked = set()
+        for job in candidates:
+            earlier_result = job.result
+            file_name = earlier_result["output"]
+            if earlier_result["input_key"] != key or file_name in checked:
+                continue
+            if len(checked) >= MAX_REUSE_CANDIDATES:
+                break
+            checked.add(file_name)
+            origin = earlier_result.get("reused_from") or job.id
+            record = read_record(file_name)
+            reason = (
+                "its render record is missing or unreadable"
+                if record is None
+                else mismatch(
+                    record,
+                    job_id=origin,
+                    input_key=key,
+                    sha256=earlier_result["render"]["output"]["sha256"],
+                )
+            )
+            if reason is not None:
+                context.note(f"not reusing {file_name}: {reason}")
+                continue
+            return self._validate_reused(
+                context, file_name, origin, earlier_result, current
+            )
+        return None
+
+    def _validate_reused(
+        self,
+        context: JobContext,
+        file_name: str,
+        origin: str,
+        earlier: Mapping[str, Any],
+        current: Mapping[str, Any],
+    ) -> Optional[JobOutcome]:
+        context.note(f"reusing {file_name} from job {origin[:8]}")
+        # 0, not RENDER_SHARE: progress never decreases within an attempt,
+        # and a failed check falls back to a render that starts at 0.
+        context.progress(STAGE_VALIDATE, 0.0)
+        nothing = {"stage": "before_render", "output": None, "ready_for_review": False}
+        stop = context.stop_reason(fresh=True)
+        if stop == STOP_CANCEL:
+            return JobOutcome.cancelled(nothing)
+        if stop == STOP_SHUTDOWN:
+            return JobOutcome.retry(
+                "interrupted", "The worker stopped before anything was published"
+            )
+        try:
+            validation = _report(self._validate.execute(output=file_name))
+        except JobCancelled:
+            return JobOutcome.cancelled(nothing)
+        except WorkerInterrupted:
+            return JobOutcome.retry(
+                "interrupted", "The worker stopped before anything was published"
+            )
+        if not _validated(validation, file_name):
+            context.note(f"not reusing {file_name}: validation did not pass")
+            return None
+        context.note(f"validated {file_name}")
+        return JobOutcome.succeeded(
+            {
+                "output": file_name,
+                "ready_for_review": True,
+                "reused_from": origin,
+                "render": earlier["render"],
+                "validate": _validate_summary(validation),
+                "plan_digest": current["plan_digest"],
+                "input_key": current["input_key"],
+            }
         )
 
     # -- worker hooks ----------------------------------------------------------
@@ -258,24 +497,28 @@ class VideoRenderHandler:
         message, result)``.  A cancellation request is honoured by the store
         before this is applied.
 
-        If the history shows a published render, the job is *not* re-run (a
-        re-run would publish a second version); the file is reported as not
-        validated.  Otherwise no render was recorded as published, and the
-        job may be retried within its attempt limit.
+        With no published render recorded, the job may be retried within
+        its attempt limit (the next attempt first looks for a render this
+        job published just before the worker died).  If the history shows a
+        published render, it is retried only when the render tool can
+        identify the job's own render (records with provenance); the next
+        attempt then validates that file and never renders again.  Without
+        that, the file is reported as not validated, as before.
         """
-        rendered = [
-            e.note[len(RENDERED_NOTE_PREFIX) :]
-            for e in events
-            if e.from_status is JobStatus.RUNNING
-            and e.note.startswith(RENDERED_NOTE_PREFIX)
-        ]
+        rendered = _rendered_names(events)
         if rendered:
             name = rendered[-1]
+            can_resume = callable(getattr(self._render, "find_job_records", None))
             return (
-                False,
+                can_resume,
                 "validate_interrupted",
                 f"The worker stopped after {name} was published; it was not "
-                "validated and is not ready for review.",
+                "validated and is not ready for review."
+                + (
+                    " The next attempt validates it without rendering again."
+                    if can_resume
+                    else ""
+                ),
                 {"output": name, "ready_for_review": False, "stage": "after_render"},
             )
         return (
@@ -446,16 +689,174 @@ def _newest_mtime(directory: Path, own_mtime: float) -> Optional[float]:
 
 def read_payload(payload: Mapping[str, Any]) -> Tuple[Optional[dict], str]:
     """Return ``(plan, "")`` or ``(None, reason)``; the plan itself is checked
-    by ``media_render`` before anything is written."""
+    by ``media_render`` before anything is written.
+
+    ``{"plan": {...}}``, optionally with ``"reuse": false`` to always render
+    instead of reusing an identical earlier job's output.
+    """
     if not isinstance(payload, Mapping):
         return None, "The payload must be a JSON object"
-    unknown = sorted(set(payload) - {"plan"})
+    unknown = sorted(set(payload) - {"plan", "reuse"})
     if unknown:
         return None, f"Unknown payload keys: {', '.join(unknown)}"
+    if not isinstance(payload.get("reuse", True), bool):
+        return None, "The payload's 'reuse' must be true or false"
     plan = payload.get("plan")
     if not isinstance(plan, dict) or not plan:
         return None, "The payload needs a 'plan' object (an EditPlan)"
     return plan, ""
+
+
+class RevisionError(ValueError):
+    """A revision cannot be queued (unsuitable parent or invalid plan)."""
+
+
+def check_plan(plan: Any, config_path: Optional[Path] = None) -> str:
+    """``""`` if *plan* is a valid EditPlan under ``[jarvis.media_render]``,
+    else the reason.  Checks shape and values only; sources are checked
+    when the job runs."""
+    from jarvis_ext.config import load_extension_section
+    from jarvis_ext.video.settings import CONFIG_SECTION, MediaRenderSettings
+
+    settings = MediaRenderSettings.from_mapping(
+        load_extension_section(CONFIG_SECTION, config_path)
+    )
+    try:
+        parse_edit_plan(plan, settings.plan_limits)
+    except PlanError as exc:
+        return f"Invalid plan: {exc}"
+    return ""
+
+
+def make_payload(
+    plan: Any, *, reuse: bool = True, config_path: Optional[Path] = None
+) -> Dict[str, Any]:
+    """The payload for a new ``video.render`` job; raises :class:`RevisionError`."""
+    payload: Dict[str, Any] = {"plan": plan}
+    if not reuse:
+        payload["reuse"] = False
+    _, problem = read_payload(payload)
+    if not problem:
+        problem = check_plan(plan, config_path)
+    if problem:
+        raise RevisionError(problem)
+    return payload
+
+
+def revision_payload(
+    parent: Job,
+    plan: Any,
+    *,
+    reuse: bool = True,
+    config_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """The payload for a revision of *parent*: a complete replacement plan.
+
+    The parent must be a finished ``video.render`` job.  The revision keeps
+    the parent's ``output_name`` (filled in if the plan leaves it out), so
+    it is published as the next version and earlier versions stay as they
+    are.  Raises :class:`RevisionError`; nothing is queued.
+    """
+    if parent.kind != KIND:
+        raise RevisionError(f"Only {KIND} jobs can be revised")
+    if not parent.is_final:
+        raise RevisionError(
+            f"Job {parent.id[:8]} is still {parent.status.value}; revise it once "
+            "it has finished (or cancel it first)."
+        )
+    parent_plan, problem = read_payload(parent.payload)
+    name = parent_plan.get("output_name") if parent_plan else None
+    if not isinstance(name, str):
+        raise RevisionError(
+            f"Job {parent.id[:8]} has no usable plan to revise"
+            + (f" ({problem})" if problem else "")
+        )
+    if not isinstance(plan, dict) or not plan:
+        raise RevisionError("A revision needs a complete EditPlan object")
+    plan = dict(plan)
+    if "output_name" not in plan:
+        plan["output_name"] = name
+    elif plan["output_name"] != name:
+        raise RevisionError(
+            f"A revision keeps the output name {name!r} so it becomes the next "
+            f"version; this plan names {plan['output_name']!r}. Submit a new job "
+            "for a different name."
+        )
+    return make_payload(plan, reuse=reuse, config_path=config_path)
+
+
+def _events(context: JobContext) -> List[JobEvent]:
+    try:
+        return context.store.events(context.job.id)
+    except JobError as exc:
+        logger.warning("History for job %s unavailable: %s", context.job.id, exc)
+        return []
+
+
+def _rendered_names(events: List[JobEvent]) -> List[str]:
+    return [
+        e.note[len(RENDERED_NOTE_PREFIX) :]
+        for e in events
+        if e.from_status is JobStatus.RUNNING
+        and e.note.startswith(RENDERED_NOTE_PREFIX)
+    ]
+
+
+def _validated(validation: Mapping[str, Any], file_name: str) -> bool:
+    """Validation passed and made review files for *file_name*."""
+    return (
+        validation.get("_success") is True
+        and validation.get("validation_status") == "passed"
+        and validation.get("ready_for_review") is True
+        and validation.get("output") == file_name
+        and isinstance(validation.get("preview"), str)
+        and isinstance(validation.get("thumbnail"), str)
+    )
+
+
+def _validation_interrupted(
+    message: str, result: Dict[str, Any], resumable: bool
+) -> JobOutcome:
+    if resumable:
+        # The record identifies this job and its inputs: the next attempt
+        # validates the same file (see _resume) instead of rendering.
+        return JobOutcome.retry(
+            "validate_interrupted",
+            message + " The next attempt validates it without rendering again.",
+            result,
+        )
+    # Not retried: without provenance a retry would render a second version.
+    return JobOutcome.failed("validate_interrupted", message, result)
+
+
+def _reusable_result(result: Any, digest: str) -> bool:
+    """A succeeded job's result that may name a reusable output."""
+    if not isinstance(result, dict):
+        return False
+    render = result.get("render")
+    output = render.get("output") if isinstance(render, dict) else None
+    return (
+        result.get("ready_for_review") is True
+        and result.get("plan_digest") == digest
+        and is_digest(result.get("input_key"))
+        and _plain_mp4_name(result.get("output"))
+        and isinstance(output, dict)
+        and output.get("file") == result.get("output")
+        and is_digest(output.get("sha256"))
+    )
+
+
+def _record_summary(file_name: str, record: Mapping[str, Any]) -> Dict[str, Any]:
+    """A render summary rebuilt from a record (for a resumed render)."""
+    return _render_summary(
+        {
+            "render_status": "succeeded",
+            "output": record.get("output"),
+            "record": file_name[: -len(".mp4")] + ".render.json",
+            "ffmpeg_version": record.get("ffmpeg_version"),
+            "warnings": record.get("warnings"),
+        }
+    )
 
 
 def _report(tool_result: Any) -> Dict[str, Any]:
@@ -553,6 +954,10 @@ __all__ = [
     "stoppable_run_process",
     "RENDER_PERMANENT",
     "RENDER_RETRYABLE",
+    "RevisionError",
     "VideoRenderHandler",
+    "check_plan",
+    "make_payload",
     "read_payload",
+    "revision_payload",
 ]

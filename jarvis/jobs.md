@@ -4,15 +4,17 @@ Phase 3 turns long-running work into **jobs**, starting with renders. A job
 is tracked from submission to a final status, can be cancelled, and is
 retried only when that is safe.
 
-**What exists today (steps 1–5):** the job model, its status rules, the
+**What exists today (steps 1–6):** the job model, its status rules, the
 SQLite job store, a runner that executes one `video.render` job through
 the existing render and validate tools, a worker with a `jobs` CLI
-(submit, list, show, cancel, worker), progress reporting from FFmpeg's
-real encoding position, and a notification for every finished job (log,
-or macOS). Revisions and agent tools are steps 6–7 in
-[ROADMAP.md](ROADMAP.md). The Phase 2 render
-pipeline is unchanged apart from two additive, opt-in hooks: a stoppable
-process runner (D29) and FFmpeg's `-progress` report (D30).
+(submit, revise, list, show, cancel, worker), progress reporting from
+FFmpeg's real encoding position, a notification for every finished job
+(log, or macOS), revisions as child jobs, verified reuse of identical
+finished outputs, and resuming a job's own published render. Agent tools
+are step 7 in [ROADMAP.md](ROADMAP.md). The Phase 2 render pipeline is
+unchanged apart from three additive, opt-in hooks: a stoppable process
+runner (D29), FFmpeg's `-progress` report (D30) and a `provenance` block
+in the render record (D32).
 
 The job layer is shared by every JARVIS skill. It knows nothing about video,
 FFmpeg or HyperFrames (DECISIONS.md D25); notifications are generic too:
@@ -111,8 +113,10 @@ Handlers can call `context.cancel_requested()` between stages and
 ### `video.render`
 
 Payload: `{"plan": {...}}`, a complete `EditPlan` (see
-[video-pipeline.md](video-pipeline.md)). Any other key, or a missing or
-empty plan, fails the job (`invalid_payload`) before anything runs.
+[video-pipeline.md](video-pipeline.md)), optionally with `"reuse": false`
+(always render; see step 6). Any other key, or a missing or empty plan,
+fails the job (`invalid_payload`) before anything runs. `jobs submit` and
+`jobs revise` also check the plan's shape and values before queueing.
 
 ```python
 from jarvis_ext.jobs import open_job_store
@@ -135,6 +139,7 @@ made) for that same file.
 | Render failed with `workspace_unavailable`, `output_unavailable`, `ffmpeg_failed` or `output_error` | Retried once (2 attempts in total), then `failed` | `render_<status>` |
 | Render failed with any other status (`invalid_plan`, `access_denied`, `invalid_media`, `unsupported`, `ffmpeg_missing`, `timeout`, `failed_checks`, …) | `failed` | `render_<status>` |
 | Render succeeded, validation did not pass | `failed`, **not retried** (a retry would render a second version). The result names the unvalidated file | `validate_<status>` |
+| Render published, then validation interrupted (forced stop) | Retried once as *validation only* (step 6), then `failed` | `validate_interrupted` |
 | A tool's report is unreadable or contradicts itself | `failed` | `unexpected_result` |
 | Cancellation requested before the render | `cancelled`; nothing rendered | |
 | Cancellation requested after the render, before validation | `cancelled`; the result lists the file as published but **not validated** | |
@@ -145,8 +150,9 @@ The result keeps `output`, `ready_for_review`, and a compact `render` and
 names of failed checks, up to 50 warnings).
 
 All Phase 2 output guarantees still apply, because the tools do the work:
-nothing is overwritten (a second job for the same plan produces `_v002`),
-and a render is only named after its checks pass. A render whose FFmpeg is
+nothing is overwritten (a second job for the same plan produces `_v002`,
+unless it reuses `_v001`, step 6), and a render is only named after its
+checks pass. A render whose FFmpeg is
 stopped publishes nothing and leaves no temp folder (tested with real
 FFmpeg).
 
@@ -154,6 +160,7 @@ FFmpeg).
 
 ```bash
 uv run python -m jarvis_ext jobs submit plan.json      # queue a video.render job (or - for stdin)
+uv run python -m jarvis_ext jobs revise 3f2a9c plan.json  # queue a revision (step 6)
 uv run python -m jarvis_ext jobs list [--status failed] [--kind video.render] [--limit 20]
 uv run python -m jarvis_ext jobs show 3f2a9c           # full id or its first 6+ characters
 uv run python -m jarvis_ext jobs cancel 3f2a9c
@@ -178,10 +185,11 @@ next. Jobs run strictly one after another (D20).
 
 **Stopping.** The first Ctrl-C or SIGTERM lets the current job finish and
 then exits. A second one stops the current job now: FFmpeg is stopped and
-the job is recorded as interrupted (requeued if it was still rendering,
-failed with `validate_interrupted` if its render was already published,
-because re-running would create a second version). A forced stop uses up
-one of the job's attempts.
+the job is recorded as interrupted: requeued if it was still rendering;
+if its render was already published, requeued for **validation only**
+when the render record identifies the job (step 6), otherwise failed with
+`validate_interrupted`, because re-running would create a second version.
+A forced stop uses up one of the job's attempts.
 
 **Cancelling a running job.** `jobs cancel` sets `cancel_requested`. While
 FFmpeg runs, the worker checks for this about twice a second; it then
@@ -202,7 +210,7 @@ database transaction that changes the job. Such a job is:
 | Situation | Result |
 |---|---|
 | A cancellation was requested | `cancelled` |
-| Its history shows a published render (`rendered <file>`) | `failed`, `validate_interrupted`; the file is listed as not validated. It is not re-rendered, so no second version is created |
+| Its history shows a published render (`rendered <file>`) | requeued (`validate_interrupted`) while attempts remain; the next attempt validates that file only if its record identifies this job, and never re-renders (step 6). With no attempts left: `failed`, the file listed as not validated |
 | No published render recorded, attempts left | requeued (`interrupted`) after `retry_delay_seconds` |
 | No attempts left | `failed`, `interrupted` |
 | A kind this worker has no handler for | `failed`, `interrupted` |
@@ -353,6 +361,107 @@ Other skills get notifications for free by finishing jobs through the
 store. `jarvis_ext.notify` (`Notification`, `make_notifier`) can also be
 used directly; it knows nothing about jobs.
 
+## Revisions and reuse (step 6)
+
+### Revisions
+
+```bash
+uv run python -m jarvis_ext jobs revise JOB_ID PLAN.json [--no-reuse] [--config PATH]
+```
+
+`JOB_ID` (full or first 6+ characters) is the job to revise; `PLAN.json`
+(or `-`) is a **complete replacement** `EditPlan`; partial edits (JSON
+Patch / Merge Patch) are not supported (D22). Before anything is queued:
+
+* the parent must exist, be a `video.render` job and be finished
+  (`succeeded`, `failed` or `cancelled`); a queued or running job is
+  refused;
+* the plan keeps the parent's `output_name`: it is filled in if left out,
+  and a different name is refused (submit a new job instead), so the
+  revision is published as the next version (`reel_v002.mp4`);
+* the plan's shape and values are checked (`Invalid plan: …`).
+
+The child job has `parent_id` set; the output is the same JSON as
+`jobs submit` (now with `parent_id`). The parent, its result, its history
+and every existing file are left as they are, whether the revision
+succeeds or fails. `jobs show`/`list` include `parent_id` and, for a
+reused result, `reused_from`.
+
+### Provenance in the render record
+
+Renders made by the job handler carry an optional `provenance` block in
+`<name>_vNNN.render.json` (D24, D32). Renders from an agent or
+`media-render` are unchanged.
+
+```json
+"provenance": {
+  "key_version": 1,
+  "job_id": "3f2a9c…",              // the job that published this file
+  "plan_digest": "…",               // SHA-256 of the normalised plan
+  "input_key": "…",                 // SHA-256 over everything below, or null
+  "sources": [{"source": "Shoot/a.mp4", "size_bytes": 123, "sha256": "…"}],
+  "subtitles_sha256": "…", "logo_sha256": null
+}
+```
+
+The **input key** covers the normalised plan, its preset, the FFmpeg
+version, the exact FFmpeg command (every option, the filter graph, the
+colour handling chosen for this FFmpeg's capabilities, and the source,
+logo and FFmpeg paths) and the SHA-256 of every source file, the
+subtitle text and the logo. Sources are hashed in full before FFmpeg
+starts; if one changes during the render (size or modification time),
+`input_key` is `null` and that file is never reused or resumed. No
+absolute path is stored. The job's result keeps `plan_digest` and
+`input_key` too.
+
+### Reuse
+
+Before rendering, a job looks for an earlier **succeeded** `video.render`
+job with the same plan digest (cheap). Only then does it compute its own
+input key (probes and hashes the sources). It reuses an earlier output
+only if **all** of these hold:
+
+1. the earlier job is `succeeded` with `ready_for_review: true` (failed,
+   cancelled and unvalidated jobs are never candidates) and its result has
+   an input key equal to this job's;
+2. the render record on disk names the job that published the file (by
+   id, not by file name), with the same input key and the SHA-256 the
+   earlier job recorded;
+3. `media_validate` passes on the file **again**: size and SHA-256 against
+   the record, probe against the plan, a full decode, and a fresh preview
+   and thumbnail. So a reused result meets exactly the readiness rules of
+   a new render.
+
+The job then succeeds with `output` = the earlier file, `reused_from` =
+the job that rendered it, the earlier render summary and the new
+validation summary; its history shows `reusing <file> from job <id>` and
+`validated <file>`; its stage is `validate` from 0 % (so a fallback
+render still starts from 0 %), and it reaches 100 % only after validation. If any
+check fails, the history says why (`not reusing <file>: …`) and the job
+renders a new version as usual. `--no-reuse` (payload `"reuse": false`)
+always renders. Reuse adds the time to hash the sources and to validate
+the earlier file; it saves the render.
+
+### Resuming a job's own render
+
+A worker can die (or be force-stopped) after a render was published but
+before it was recorded or validated. On a later attempt the job first
+looks for renders whose record names **this job's id** (the file name only
+narrows the search):
+
+| Found | What happens |
+|---|---|
+| One, with the input key the plan resolves to now | `resuming <file>`: validated without rendering; `succeeded` (with `resumed: true`) only if validation passes; a failed validation fails the job without rendering again |
+| One, but the inputs changed since (or a source cannot be read) | `not resuming <file>: …`; renders a new version |
+| More than one | `failed`, `resume_ambiguous`; nothing is used or rendered |
+| None, but the history says `rendered <file>` (a record without provenance, e.g. from before step 6) | `failed`, `validate_interrupted`, as before; never re-rendered |
+| None and no `rendered` note | renders as usual |
+
+So the crash window between publishing and recording `rendered <file>`
+no longer produces a second version, and an interrupted validation is
+finished instead of failing the job. No database change was needed:
+provenance lives in the render record, the rest in the job's result.
+
 ## Storage and safety
 
 * **Location:** `<OPENJARVIS_HOME>/jarvis/jobs.db` (normally
@@ -415,8 +524,28 @@ with open_job_store() as store:                  # reads [jarvis.jobs]
 ```bash
 uv run pytest tests/jarvis_ext/test_job_store.py tests/jarvis_ext/test_job_runner.py \
     tests/jarvis_ext/test_job_worker.py tests/jarvis_ext/test_job_progress.py \
-    tests/jarvis_ext/test_job_notifications.py -v
+    tests/jarvis_ext/test_job_notifications.py tests/jarvis_ext/test_job_revisions.py -v
 ```
+
+`test_job_revisions.py` covers revision payloads and the `revise` CLI
+(child job and `parent_id`, output name kept or filled in, unfinished,
+missing, other-kind parents and invalid plans refused before queueing,
+`--no-reuse`, parent untouched, next version rendered, a failed revision
+leaving earlier files unchanged), the provenance record (contents, no
+absolute paths, unchanged without provenance, a source changing during
+the render), reuse (no render, re-validation, history, notifications,
+equivalent plan spellings, reuse of a reuse) and every refusal falling
+back to a fresh version (plan, preset, FFmpeg version, source content,
+modified or deleted output, deleted or altered record, wrong checksum,
+`--no-reuse`, failed validation, missing review files, failed,
+cancelled, unvalidated and legacy jobs), and resuming (with and without
+the `rendered` note, records without provenance, same name but another
+job, changed inputs, a corrupted file, ambiguity, interrupted validation,
+last attempt, cancellation). These use the real render tool with fake
+FFmpeg. Its real-FFmpeg tests run submit → revise (v002, v001 unchanged)
+→ identical revise reused → v002 corrupted → v003 rendered, and a
+published-but-unrecorded render resumed by a restarted worker with real
+validation and exactly one version.
 
 `test_job_notifications.py` covers message text for each outcome (and
 that error messages, paths and payloads never appear), text cleaning of
@@ -444,7 +573,8 @@ FFmpeg and publishes nothing.
 recovery, the stoppable process runner, temp-folder cleanup, the worker
 (once, loop, graceful and forced stop, locking, recovery on start) and
 every CLI command. Its real-FFmpeg tests submit and run jobs through the
-CLI (v001, then v002 with v001 unchanged), cancel a render mid-encode and
+CLI (v001, an identical job reusing v001, then `--no-reuse` giving v002
+with v001 unchanged), cancel a render mid-encode and
 check FFmpeg is gone and nothing is published, force a worker shutdown
 mid-encode, and SIGKILL a worker mid-render, then recover the job and
 finish it with exactly one published version.
@@ -467,15 +597,27 @@ claiming across threads and processes, and `[jarvis.jobs]` settings.
   writes inside its temp folder; nothing is published without the worker,
   and the folder is cleaned up once it is old. Stopping the worker with
   Ctrl-C/SIGTERM does stop FFmpeg.
-* **A tiny window can still produce an extra version.** If the worker dies
-  in the milliseconds between publishing a render and recording
-  `rendered <file>`, recovery cannot know the file exists and re-renders,
-  publishing the next version (nothing is overwritten). Closing this needs
-  a job id in the render record (D24), not done without your approval.
-* **Interrupted jobs are not resumed at validation.** A job interrupted
-  after its render was published fails with the file listed; validate it
-  with `media-validate` and re-submit if needed. Resuming needs the same
-  D24 change.
+* **A much smaller window can still produce an extra version.** The
+  render and its record are published one after the other; if the worker
+  dies between the two (or the record cannot be written), nothing ties
+  the file to the job and the next attempt renders the next version.
+  Nothing is overwritten.
+* **Older renders cannot be resumed or reused.** Records without a
+  `provenance` block (Phase 2, steps 1–5, or `media-render`) are never
+  associated with a job; such a job interrupted after publishing still
+  fails with `validate_interrupted`.
+* **Reuse and provenance hash the sources.** Every job render reads each
+  source once more to checksum it (and reuse checks do the same); for
+  very large footage on a slow drive this adds noticeable time. A
+  cancellation is only noticed once hashing is done and FFmpeg starts.
+* **Reuse re-validates.** A reused output gets a new preview and
+  thumbnail version in `review/` (never overwritten).
+* **The input key is conservative.** Moving the workspace, the FFmpeg
+  binary or a source (even unchanged), or upgrading FFmpeg, prevents reuse
+  even if the output would be identical. JARVIS's own code version is
+  not part of the key: a change to how commands are built changes the
+  command and so the key, but a change to the pre-publish checks alone
+  does not.
 * **A forced stop or a crash uses an attempt.** With `max_attempts = 2`,
   a job interrupted twice fails.
 * **macOS and Linux only.** The worker lock uses `fcntl.flock`.

@@ -5,7 +5,8 @@
     python -m jarvis_ext media-render PLAN.json [--validate] [--config PATH]
     python -m jarvis_ext media-validate OUTPUT [--no-preview]
         [--thumbnail-at SECONDS] [--config PATH]
-    python -m jarvis_ext jobs submit PLAN.json [--config PATH]
+    python -m jarvis_ext jobs submit PLAN.json [--no-reuse] [--config PATH]
+    python -m jarvis_ext jobs revise JOB_ID PLAN.json [--no-reuse] [--config PATH]
     python -m jarvis_ext jobs list [--status S] [--kind K] [--limit N]
     python -m jarvis_ext jobs show JOB_ID
     python -m jarvis_ext jobs cancel JOB_ID
@@ -16,7 +17,10 @@ the tool reports an error (for example an unconfigured workspace or a failed
 validation).  ``PLAN.json`` may be ``-`` to read the plan from stdin.
 
 ``jobs`` commands print JSON on stdout; errors go to stderr with exit
-status 1.  ``JOB_ID`` may be the first 6+ characters of an id.  The worker
+status 1.  ``JOB_ID`` may be the first 6+ characters of an id.  ``revise``
+queues a child job with a complete replacement plan (same output name, so
+it becomes the next version); ``--no-reuse`` always renders instead of
+reusing an identical earlier job's output.  The worker
 logs progress to stderr and prints a report when it exits; Ctrl-C (or
 SIGTERM) lets the current job finish, a second one stops it now.  It sends
 a notification for each finished job (``[jarvis.jobs] notifications``).
@@ -67,8 +71,12 @@ def _jobs(args: argparse.Namespace) -> int:
 
     try:
         settings = JobSettings.load(args.config)
-        if args.jobs_command == "submit":
-            from jarvis_ext.video.render_job import KIND, read_payload
+        if args.jobs_command in ("submit", "revise"):
+            from jarvis_ext.video.render_job import (
+                KIND,
+                make_payload,
+                revision_payload,
+            )
 
             try:
                 plan = json.loads(_read_text(args.plan))
@@ -78,13 +86,18 @@ def _jobs(args: argparse.Namespace) -> int:
             except ValueError as exc:
                 print(f"The plan is not valid JSON: {exc}", file=sys.stderr)
                 return 1
-            payload = {"plan": plan}
-            _, problem = read_payload(payload)
-            if problem:
-                print(problem, file=sys.stderr)
-                return 1
+            reuse = not args.no_reuse
             with open_job_store(settings) as store:
-                job = store.submit(KIND, payload)
+                # Everything is checked before anything is queued.
+                if args.jobs_command == "revise":
+                    parent = store.find(args.job_id)
+                    payload = revision_payload(
+                        parent, plan, reuse=reuse, config_path=args.config
+                    )
+                    job = store.submit(KIND, payload, parent_id=parent.id)
+                else:
+                    payload = make_payload(plan, reuse=reuse, config_path=args.config)
+                    job = store.submit(KIND, payload)
             _print_json(
                 {
                     **job_summary(job),
@@ -233,6 +246,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     job_commands = jobs.add_subparsers(dest="jobs_command", required=True)
     submit = job_commands.add_parser("submit", help="Queue a video.render job.")
     submit.add_argument("plan", help="Edit plan JSON file, or - for stdin")
+    revise = job_commands.add_parser(
+        "revise", help="Queue a revision of a finished video.render job."
+    )
+    revise.add_argument("job_id", help="The job to revise")
+    revise.add_argument(
+        "plan", help="Complete replacement edit plan JSON file, or - for stdin"
+    )
+    for sub in (submit, revise):
+        sub.add_argument(
+            "--no-reuse",
+            action="store_true",
+            help="Always render, even if an identical earlier output exists",
+        )
     listing = job_commands.add_parser("list", help="List recent jobs.")
     listing.add_argument("--status", choices=[s.value for s in JobStatus])
     listing.add_argument("--kind")
@@ -245,7 +271,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     worker.add_argument(
         "--once", action="store_true", help="Run at most one job, then exit"
     )
-    for sub in (submit, listing, show, cancel, worker):
+    for sub in (submit, revise, listing, show, cancel, worker):
         sub.add_argument("--config", type=Path, help="config.toml to read")
 
     args = parser.parse_args(argv)

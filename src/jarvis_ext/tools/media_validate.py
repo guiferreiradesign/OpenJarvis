@@ -17,13 +17,18 @@ report ``ready_for_review: true``.
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from jarvis_ext.tools._video_base import Refused, VideoToolBase, sha256_file
+from jarvis_ext.tools._video_base import (
+    MAX_RECORD_BYTES,
+    Refused,
+    VideoToolBase,
+    read_render_record,
+    sha256_file,
+)
 from jarvis_ext.tools.media_workspace import probe_media
 from jarvis_ext.video.checks import (
     Expectations,
@@ -42,7 +47,6 @@ from jarvis_ext.video.ffmpeg import (
     minimal_env,
 )
 from jarvis_ext.video.output import (
-    RECORD_SUFFIX,
     REVIEW_DIRNAME,
     OutputError,
     OutputFolder,
@@ -52,7 +56,6 @@ from openjarvis.core.types import ToolResult
 from openjarvis.tools._stubs import ToolSpec
 
 TOOL_NAME = "media_validate"
-MAX_RECORD_BYTES = 1024 * 1024
 _JPEG_MAGIC = b"\xff\xd8\xff"
 
 
@@ -124,26 +127,7 @@ class MediaValidateTool(VideoToolBase):
 
     @staticmethod
     def _read_record(folder: OutputFolder, output: str) -> Mapping[str, Any]:
-        name = output[: -len(".mp4")] + RECORD_SUFFIX
-        try:
-            path = folder.resolve_child(name)
-        except FileNotFoundError:
-            raise Refused(
-                "no_record",
-                f"No render record ({name}) found; only files produced by "
-                "media_render can be validated.",
-            ) from None
-        except OutputError as exc:
-            raise Refused("no_record", f"Render record unusable: {exc}") from None
-        if path.stat().st_size > MAX_RECORD_BYTES:
-            raise Refused("no_record", "Render record is too large")
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            raise Refused("no_record", "Render record is not readable JSON") from None
-        if not isinstance(record, dict) or not isinstance(record.get("plan"), dict):
-            raise Refused("no_record", "Render record is malformed")
-        return record
+        return read_render_record(folder, output)
 
     # -- helpers ------------------------------------------------------------
 
@@ -342,4 +326,4 @@ class MediaValidateTool(VideoToolBase):
         return result
 
 
-__all__ = ["MediaValidateTool", "TOOL_NAME"]
+__all__ = ["MAX_RECORD_BYTES", "MediaValidateTool", "TOOL_NAME"]

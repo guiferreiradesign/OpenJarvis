@@ -1070,10 +1070,20 @@ class TestRealFfmpegWorker:
         before = digest_tree(workspace)
         plan = tmp_path / "plan.json"
         plan.write_text(json.dumps(self.plan()))
-        for expected in ("worker_reel_v001.mp4", "worker_reel_v002.mp4"):
-            code, out, _ = cli(capsys, "submit", str(plan), "--config", str(config))
+        # Step 6: the identical second job reuses v001 (validated again);
+        # --no-reuse renders v002.
+        first_id = None
+        for expected, extra in (
+            ("worker_reel_v001.mp4", []),
+            ("worker_reel_v001.mp4", []),
+            ("worker_reel_v002.mp4", ["--no-reuse"]),
+        ):
+            code, out, _ = cli(
+                capsys, "submit", str(plan), *extra, "--config", str(config)
+            )
             job_id = json.loads(out)["id"]
-            if expected.endswith("v002.mp4"):
+            first_id = first_id or job_id
+            if first_id != job_id:
                 v1 = (output / "worker_reel_v001.mp4").read_bytes()
             code, out, err = cli(capsys, "worker", "--once", "--config", str(config))
             assert code == 0, err
@@ -1082,6 +1092,8 @@ class TestRealFfmpegWorker:
             assert job["status"] == "succeeded", job
             assert job["result"]["output"] == expected
             assert job["result"]["ready_for_review"] is True
+            reused = job["result"].get("reused_from")
+            assert reused == (first_id if job_id != first_id and not extra else None)
         assert (output / "worker_reel_v001.mp4").read_bytes() == v1
         assert digest_tree(workspace) == before
         assert not any((output / ".jarvis-tmp").iterdir())

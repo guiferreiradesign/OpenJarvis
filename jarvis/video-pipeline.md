@@ -310,6 +310,7 @@ thumbnail is taken from the middle of the video unless `--thumbnail-at` /
 <output_root>/
     skyline_reel_v001.mp4
     skyline_reel_v001.render.json     plan, preset, checks, size, SHA-256, FFmpeg version
+                                      (+ job provenance for job renders, jobs.md step 6)
     skyline_reel_v002.mp4             a later render of the same output_name
     review/skyline_reel_v001_preview_v001.mp4
     review/skyline_reel_v001_thumb_v001.jpg

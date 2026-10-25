@@ -26,7 +26,7 @@ from jarvis_ext.video.ffmpeg import (
     query_capabilities,
     run_process,
 )
-from jarvis_ext.video.output import OutputError, OutputFolder
+from jarvis_ext.video.output import RECORD_SUFFIX, OutputError, OutputFolder
 from jarvis_ext.video.settings import (
     CONFIG_SECTION as RENDER_SECTION,
 )
@@ -53,6 +53,37 @@ class Refused(Exception):
         self.status = status
         self.message = message
         self.extra = extra
+
+
+MAX_RECORD_BYTES = 1024 * 1024
+
+
+def read_render_record(folder: OutputFolder, output: str) -> Dict[str, Any]:
+    """The ``.render.json`` record of a published render such as ``reel_v001.mp4``.
+
+    Raises :class:`Refused` (``no_record``) if it is missing, a link, too
+    large, not JSON, or has no plan.
+    """
+    name = output[: -len(".mp4")] + RECORD_SUFFIX
+    try:
+        path = folder.resolve_child(name)
+    except FileNotFoundError:
+        raise Refused(
+            "no_record",
+            f"No render record ({name}) found; only files produced by "
+            "media_render can be validated.",
+        ) from None
+    except OutputError as exc:
+        raise Refused("no_record", f"Render record unusable: {exc}") from None
+    if path.stat().st_size > MAX_RECORD_BYTES:
+        raise Refused("no_record", "Render record is too large")
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise Refused("no_record", "Render record is not readable JSON") from None
+    if not isinstance(record, dict) or not isinstance(record.get("plan"), dict):
+        raise Refused("no_record", "Render record is malformed")
+    return record
 
 
 def sha256_file(path: Path) -> str:
@@ -193,4 +224,4 @@ class VideoToolBase(BaseTool):
         return redact
 
 
-__all__ = ["Refused", "VideoToolBase", "sha256_file"]
+__all__ = ["Refused", "VideoToolBase", "read_render_record", "sha256_file"]

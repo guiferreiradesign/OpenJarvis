@@ -16,21 +16,34 @@ Flow
 
 A successful render is *not* the same as a validated one: the result always
 says ``ready_for_review: false`` and points to ``media_validate``.
+
+Provenance (D32): a tool created with ``record_provenance=True`` (only the
+job handler does this) accepts ``provenance={"job_id": ...}``; it then
+checksums every input before rendering and adds a ``provenance`` block to
+the record (see :mod:`jarvis_ext.video.provenance`).  Otherwise that
+parameter is ignored and the render and its record are exactly as before.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
 import subprocess
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from jarvis_ext._workspace import AccessDenied, resolve_relative
-from jarvis_ext.tools._video_base import Refused, VideoToolBase, sha256_file
+from jarvis_ext.tools._video_base import (
+    Refused,
+    VideoToolBase,
+    read_render_record,
+    sha256_file,
+)
 from jarvis_ext.tools.media_workspace import probe_media
 from jarvis_ext.video.checks import Expectations, all_passed, check_media, failed_names
 from jarvis_ext.video.ffmpeg import (
@@ -46,8 +59,19 @@ from jarvis_ext.video.ffmpeg import (
     minimal_env,
     png_dimensions,
 )
-from jarvis_ext.video.output import RECORD_SUFFIX, OutputError
+from jarvis_ext.video.output import (
+    RECORD_SUFFIX,
+    OutputError,
+    OutputFolder,
+    parse_render_name,
+)
 from jarvis_ext.video.plan import EditPlan, PlanError, parse_edit_plan
+from jarvis_ext.video.provenance import (
+    KEY_VERSION,
+    canonical_digest,
+    is_job_id,
+    record_provenance,
+)
 from jarvis_ext.video.subtitles import (
     MAX_SUBTITLE_BYTES,
     SubtitleError,
@@ -67,6 +91,26 @@ MAX_LOGO_PIXELS = 8192
 # Allow tiny container/stream rounding when comparing an out-point with the
 # probed source duration.
 _END_EPSILON = 0.001
+MAX_RECORDS_SCANNED = 2000
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    """Everything a render needs, checked, before anything is written."""
+
+    folder: OutputFolder
+    plan: EditPlan
+    ffmpeg: str
+    ffprobe: str
+    capabilities: FfmpegCapabilities
+    clips: List[ClipInput]
+    subtitles: Optional[str]
+    logo: Optional[LogoInput]
+
+
+def plan_digest(plan: EditPlan) -> str:
+    """Digest of the normalised plan (times in seconds, defaults applied)."""
+    return canonical_digest(plan.to_dict())
 
 
 class MediaRenderTool(VideoToolBase):
@@ -75,12 +119,20 @@ class MediaRenderTool(VideoToolBase):
     tool_id = TOOL_NAME
     status_key = "render_status"
 
-    def __init__(self, *, report_progress: bool = False, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        report_progress: bool = False,
+        record_provenance: bool = False,
+        **kwargs: Any,
+    ) -> None:
         """*report_progress* adds FFmpeg's ``-progress`` report to the render
         command (used by the job runner); off by default, so the command is
-        otherwise unchanged."""
+        otherwise unchanged.  *record_provenance* lets the job runner have
+        its job id and input checksums recorded (see the module docs)."""
         super().__init__(**kwargs)
         self._report_progress = report_progress
+        self.records_provenance = record_provenance
 
     @property
     def spec(self) -> ToolSpec:
@@ -331,31 +383,203 @@ class MediaRenderTool(VideoToolBase):
 
     # -- entry point --------------------------------------------------------
 
+    def _prepare(self, params: Mapping[str, Any], warnings: List[str]) -> _Prepared:
+        """Steps 1–3 of the flow; raises :class:`Refused`."""
+        folder, root = self._preflight()
+        plan = self._read_plan(params)
+        ffmpeg, ffprobe = self._find_tools()
+        capabilities = self._ffmpeg_capabilities(ffmpeg)
+        missing = capabilities.missing_for(plan)
+        if missing:
+            hint = ""
+            if "subtitles" in missing:
+                hint = (
+                    " Subtitle burn-in needs an FFmpeg built with libass; "
+                    "use subtitles.mode 'embed' instead."
+                )
+            raise Refused(
+                "unsupported",
+                "This FFmpeg build lacks: " + ", ".join(missing) + "." + hint,
+            )
+        clips = self._resolve_clips(plan, root, ffprobe, capabilities, warnings)
+        subtitles = self._load_subtitles(plan, root, warnings)
+        logo = self._load_logo(plan)
+        return _Prepared(
+            folder, plan, ffmpeg, ffprobe, capabilities, clips, subtitles, logo
+        )
+
+    # -- provenance (job runner only) ---------------------------------------
+
+    def _identity(
+        self, prep: _Prepared
+    ) -> Tuple[Dict[str, Any], Dict[Path, Tuple[int, int]]]:
+        """Checksum every input and derive the input key.
+
+        Returns the provenance block (without ``job_id``) and each source's
+        ``(size, mtime_ns)`` as hashed, so a change during the render can be
+        detected.  Raises :class:`Refused` if a file cannot be read.
+        """
+        plan = prep.plan
+        sources: List[Dict[str, Any]] = []
+        stats: Dict[Path, Tuple[int, int]] = {}
+        for clip, item in zip(plan.clips, prep.clips):
+            if item.path in stats:
+                continue
+            try:
+                before = os.stat(item.path)
+                digest = sha256_file(item.path)
+                after = os.stat(item.path)
+            except OSError:
+                raise Refused(
+                    "invalid_media", f"{clip.source} cannot be read"
+                ) from None
+            if (before.st_size, before.st_mtime_ns) != (
+                after.st_size,
+                after.st_mtime_ns,
+            ):
+                raise Refused(
+                    "invalid_media", f"{clip.source} changed while it was read"
+                )
+            stats[item.path] = (after.st_size, after.st_mtime_ns)
+            sources.append(
+                {"source": clip.source, "size_bytes": after.st_size, "sha256": digest}
+            )
+        logo_sha = None
+        if prep.logo is not None:
+            try:
+                logo_sha = sha256_file(prep.logo.path)
+            except OSError:
+                raise Refused("invalid_plan", "branding.asset cannot be read") from None
+        subtitles_sha = (
+            hashlib.sha256(prep.subtitles.encode("utf-8")).hexdigest()
+            if prep.subtitles is not None
+            else None
+        )
+        command = build_render_command(
+            prep.ffmpeg,
+            plan,
+            prep.clips,
+            logo=prep.logo,
+            capabilities=prep.capabilities,
+            progress=False,
+        )
+        block: Dict[str, Any] = {
+            "key_version": KEY_VERSION,
+            "plan_digest": plan_digest(plan),
+            "sources": sources,
+            "subtitles_sha256": subtitles_sha,
+            "logo_sha256": logo_sha,
+        }
+        block["input_key"] = canonical_digest(
+            {
+                **block,
+                "plan": plan.to_dict(),
+                "preset": plan.preset.to_dict(),
+                "ffmpeg_version": prep.capabilities.version,
+                "command": command,
+            }
+        )
+        return block, stats
+
+    def plan_digest(self, plan: Any) -> Optional[str]:
+        """The normalised plan's digest, or ``None`` if the plan is invalid.
+
+        Cheap (no file access): used to find earlier jobs worth checking.
+        """
+        if self._config_error:
+            return None
+        try:
+            return plan_digest(self._read_plan({"plan": plan}))
+        except Refused:
+            return None
+
+    def fingerprint(self, plan: Any) -> Dict[str, Any]:
+        """``{"status": "ok", "plan_digest", "input_key"}`` for *plan* as it
+        would be rendered now, or ``{"status", "error"}``.  Probes and
+        checksums every source; renders and writes nothing."""
+        try:
+            block, _ = self._identity(self._prepare({"plan": plan}, []))
+        except Refused as exc:
+            return {"status": exc.status, "error": exc.message}
+        return {
+            "status": "ok",
+            "plan_digest": block["plan_digest"],
+            "input_key": block["input_key"],
+        }
+
+    def read_record(self, output: Any) -> Optional[Dict[str, Any]]:
+        """The render record of a published file, or ``None``."""
+        if not isinstance(output, str) or parse_render_name(output) is None:
+            return None
+        try:
+            folder, _ = self._preflight()
+            return read_render_record(folder, output)
+        except (Refused, OSError):
+            return None
+
+    def find_job_records(self, output_name: Any, job_id: Any) -> List[Dict[str, Any]]:
+        """Published renders of *output_name* whose record names *job_id*.
+
+        The file name only narrows the search; a render belongs to the job
+        only if its record's provenance says so.  Returns up to two
+        ``{"file": "reel_v002.mp4", "record": {...}}`` (two means ambiguous).
+        """
+        if not isinstance(output_name, str) or not is_job_id(job_id):
+            return []
+        try:
+            folder, _ = self._preflight()
+            names = sorted(os.listdir(folder.root))
+        except (Refused, OSError):
+            return []
+        found: List[Dict[str, Any]] = []
+        scanned = 0
+        for name in names:
+            if not name.endswith(RECORD_SUFFIX):
+                continue
+            output = name[: -len(RECORD_SUFFIX)] + ".mp4"
+            parsed = parse_render_name(output)
+            if parsed is None or parsed[0] != output_name:
+                continue
+            scanned += 1
+            if scanned > MAX_RECORDS_SCANNED:
+                break
+            try:
+                record = read_render_record(folder, output)
+            except (Refused, OSError):
+                continue
+            block = record_provenance(record)
+            if block is not None and block["job_id"] == job_id:
+                found.append({"file": output, "record": record})
+                if len(found) > 1:
+                    break
+        return found
+
+    # -- entry point --------------------------------------------------------
+
     def execute(self, **params: Any) -> ToolResult:
         started = time.monotonic()
         warnings: List[str] = []
+        provenance: Optional[Dict[str, Any]] = None
+        source_stats: Dict[Path, Tuple[int, int]] = {}
         try:
-            folder, root = self._preflight()
-            plan = self._read_plan(params)
-            ffmpeg, ffprobe = self._find_tools()
-            capabilities = self._ffmpeg_capabilities(ffmpeg)
-            missing = capabilities.missing_for(plan)
-            if missing:
-                hint = ""
-                if "subtitles" in missing:
-                    hint = (
-                        " Subtitle burn-in needs an FFmpeg built with libass; "
-                        "use subtitles.mode 'embed' instead."
-                    )
-                raise Refused(
-                    "unsupported",
-                    "This FFmpeg build lacks: " + ", ".join(missing) + "." + hint,
-                )
-            clips = self._resolve_clips(plan, root, ffprobe, capabilities, warnings)
-            subtitles = self._load_subtitles(plan, root, warnings)
-            logo = self._load_logo(plan)
+            prep = self._prepare(params, warnings)
+            requested = params.get("provenance")
+            if self.records_provenance and isinstance(requested, Mapping):
+                job_id = requested.get("job_id")
+                if not is_job_id(job_id):
+                    raise Refused("invalid_plan", "provenance.job_id is not a job id")
+                block, source_stats = self._identity(prep)
+                provenance = {"job_id": job_id, **block}
         except Refused as exc:
             return self._failure(exc, warnings)
+        folder, plan, ffmpeg, ffprobe = (
+            prep.folder,
+            prep.plan,
+            prep.ffmpeg,
+            prep.ffprobe,
+        )
+        capabilities, clips = prep.capabilities, prep.clips
+        subtitles, logo = prep.subtitles, prep.logo
 
         temp_dir: Optional[Path] = None
         try:
@@ -425,6 +649,13 @@ class MediaRenderTool(VideoToolBase):
                 )
 
             checksum = sha256_file(rendered)
+            if provenance is not None and _sources_changed(source_stats):
+                # What FFmpeg read may not be what was checksummed.
+                provenance["input_key"] = None
+                warnings.append(
+                    "A source file changed during the render; this render "
+                    "cannot be reused or resumed by a later job."
+                )
             final, version = folder.publish_versioned(
                 rendered, folder.root, plan.output_name, ".mp4"
             )
@@ -453,6 +684,8 @@ class MediaRenderTool(VideoToolBase):
                 "prepublish_checks": checks,
                 "warnings": warnings,
             }
+            if provenance is not None:
+                record["provenance"] = provenance
             try:
                 folder.write_record(temp_dir, final.with_name(record_name), record)
             except (OSError, OutputError):
@@ -486,7 +719,25 @@ class MediaRenderTool(VideoToolBase):
             "elapsed_seconds": round(time.monotonic() - started, 2),
             "warnings": warnings,
         }
+        if provenance is not None:
+            payload["provenance"] = {
+                "job_id": provenance["job_id"],
+                "plan_digest": provenance["plan_digest"],
+                # Usable only if the record carrying it was written.
+                "input_key": provenance["input_key"] if record_name else None,
+            }
         return self._result(payload, success=True)
 
 
-__all__ = ["MediaRenderTool", "TOOL_NAME"]
+def _sources_changed(stats: Mapping[Path, Tuple[int, int]]) -> bool:
+    for path, (size, mtime_ns) in stats.items():
+        try:
+            info = os.stat(path)
+        except OSError:
+            return True
+        if (info.st_size, info.st_mtime_ns) != (size, mtime_ns):
+            return True
+    return False
+
+
+__all__ = ["MediaRenderTool", "TOOL_NAME", "plan_digest"]

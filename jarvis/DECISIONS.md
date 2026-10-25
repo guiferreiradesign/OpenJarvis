@@ -447,6 +447,46 @@ notification whenever the worker dies between finishing a job and
 sending, and would need its own duplicate guard. A row written with the
 final status survives crashes and is unique by construction.
 
+## D32. Revisions, verified reuse and resume use render provenance, not a cache
+
+**Decision:**
+
+* **Revisions:** `jobs revise JOB_ID PLAN.json` queues a child job
+  (`parent_id`) with a complete replacement plan (D22). The parent must be
+  a finished `video.render` job; the `output_name` is kept (filled in or
+  enforced) so the revision is the next version. Plans are checked before
+  queueing (also for `jobs submit`).
+* **Provenance (the D24 option):** the job handler's render tool adds an
+  optional `provenance` block to the render record: job id, plan digest,
+  and an input key = SHA-256 over the normalised plan, preset, FFmpeg
+  version, exact FFmpeg command and full SHA-256 of every source,
+  subtitle text and logo. Off for agents and the CLI, so their records
+  are unchanged. No absolute paths. `record_version` stays 1 (validate
+  ignores unknown fields).
+* **Reuse:** an identical job succeeds with an earlier output only when
+  the earlier job succeeded and was ready for review, the input keys
+  match, the record names the publishing job with the same key and
+  checksum, and `media_validate` passes again (fresh review files).
+  Anything missing or different: render a new version. `--no-reuse`
+  opts out.
+* **Resume:** on a later attempt, a render whose record names this job
+  and whose key still matches is validated instead of re-rendered; two
+  such renders are ambiguous and fail the job; a `rendered` note without
+  such a record fails as before. Interrupted validation of a render with
+  provenance is retried (validation only) instead of failing.
+* **No schema change:** provenance lives in the record; `plan_digest`,
+  `input_key`, `reused_from` and `resumed` live in the job's JSON result.
+  Policy lives in `video/render_job.py` and `video/provenance.py`; the job
+  store is unchanged.
+
+**Why full-file hashes, not size + mtime:** copies and restores can keep
+both, and a wrong reuse would hand over a video of different footage.
+The cost (reading the sources once more) is small next to a render.
+
+**Why re-validate on reuse:** the earlier validation proved the file was
+good then; re-running it proves the file is still complete and decodable
+now and produces the review files a new job would have.
+
 ## Assumptions
 
 * Only you (and processes you trust) write to the media workspace. See the
