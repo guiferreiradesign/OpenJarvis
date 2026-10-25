@@ -53,6 +53,8 @@ output_root = "~/Movies/JARVIS-Renders"
 # poll_seconds = 2                   # idle worker: how often to look for work
 # heartbeat_seconds = 10             # running job: worker heartbeat interval
 # stale_after_seconds = 120          # no heartbeat this long: worker presumed dead
+# notifications = "log"              # finished jobs: "log", or "macos" for a
+#                                    # Notification Center banner as well
 
 # Let agents use the tools by default.
 [tools]

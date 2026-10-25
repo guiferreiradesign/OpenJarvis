@@ -3,7 +3,8 @@
 A job records long-running work from submission to a final status.  This
 package only stores jobs and enforces their status rules; what a job *does*
 is decided by the runner for its ``kind`` (the first will be
-``video.render``, added in Phase 3 step 2).  See ``jarvis/jobs.md``.
+``video.render``, added in Phase 3 step 2).  Every final status also owes
+one notification (``jobs/notifications.py``).  See ``jarvis/jobs.md``.
 """
 
 from __future__ import annotations
@@ -18,7 +19,9 @@ from jarvis_ext.jobs.models import (
     JobError,
     JobEvent,
     JobNotFoundError,
+    JobNotification,
     JobStatus,
+    NotificationState,
 )
 from jarvis_ext.jobs.settings import JobSettings
 from jarvis_ext.jobs.store import (
@@ -37,11 +40,13 @@ __all__ = [
     "JobError",
     "JobEvent",
     "JobNotFoundError",
+    "JobNotification",
     "JobSettings",
     "JobStatus",
     "JobStore",
     "JobStoreError",
     "MAX_ATTEMPTS",
+    "NotificationState",
     "SCHEMA_VERSION",
     "SchemaVersionError",
     "TRANSITIONS",

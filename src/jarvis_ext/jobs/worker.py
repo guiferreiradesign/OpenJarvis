@@ -5,9 +5,11 @@
     with WorkerLock(lock file)           only one worker per database
         recover stale jobs               crashed workers' jobs are settled
         clean up abandoned temp folders  (handlers that have cleanup())
+        send due notifications           finished jobs' outbox rows
         loop:
             run_next(...)                one job; heartbeat while it runs
-            nothing queued → wait poll_seconds, recover, clean up hourly
+            send due notifications       (that job's, and any retries)
+            nothing queued → wait poll_seconds, recover, notify, clean up hourly
         until stop()                     (or after one job with once=True)
 
 **Stopping.**  ``stop()`` lets the current job finish, then exits.
@@ -23,6 +25,12 @@ if its handler says the attempt can safely be repeated (and attempts
 remain), failed otherwise.  The lock guarantees no other worker is alive,
 and the heartbeat age is re-checked under the database write lock, so a
 live job is never taken over.
+
+**Notifications.**  The store records one outbox row with every final
+status (also for jobs recovered here or cancelled from the CLI); the
+worker sends due rows through its notifier between jobs (see
+``jobs/notifications.py``).  A notifier failure is logged and retried; it
+never changes a job or stops the worker.
 
 Nothing here knows about video; handlers supply ``run``, and optionally
 ``recovery(job, events)`` and ``cleanup()``.
@@ -41,9 +49,15 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from jarvis_ext.jobs.models import InvalidTransitionError, Job, JobError
+from jarvis_ext.jobs.notifications import (
+    MIN_LEASE_SECONDS,
+    deliver_notifications,
+    new_counts,
+)
 from jarvis_ext.jobs.runner import JobHandler, run_next
 from jarvis_ext.jobs.settings import JobSettings
 from jarvis_ext.jobs.store import JobStore
+from jarvis_ext.notify import LogNotifier, Notifier
 
 try:
     import fcntl
@@ -158,6 +172,7 @@ class Worker:
         worker_id: Optional[str] = None,
         cleanup_every_seconds: float = CLEANUP_EVERY_SECONDS,
         monotonic: Callable[[], float] = time.monotonic,
+        notifier: Optional[Notifier] = None,
     ) -> None:
         self.store = store
         self.handlers = dict(handlers)
@@ -169,6 +184,7 @@ class Worker:
         self._cleanup_every = cleanup_every_seconds
         self._monotonic = monotonic
         self._last_cleanup: Optional[float] = None
+        self.notifier: Notifier = notifier if notifier is not None else LogNotifier()
 
     # -- control -------------------------------------------------------------
 
@@ -194,11 +210,13 @@ class Worker:
             "processed": [],
             "recovered": [],
             "cleaned_temp_dirs": [],
+            "notifications": new_counts(),
         }
         with self._lock:
             logger.info("Worker %s started", self.worker_id)
             self._recover(report)
             self._cleanup(report)
+            self._notify(report)
             while not self._stop.is_set():
                 job = run_next(
                     self.store,
@@ -212,6 +230,7 @@ class Worker:
                     summary = job_summary(job)
                     report["processed"].append(summary)
                     _log_job(summary)
+                    self._notify(report)
                     if once:
                         break
                     continue
@@ -220,6 +239,7 @@ class Worker:
                 if self._stop.wait(self.settings.poll_seconds):
                     break
                 self._recover(report)
+                self._notify(report)
                 self._cleanup(report)
             logger.info(
                 "Worker %s stopped after %d job(s)",
@@ -286,6 +306,18 @@ class Worker:
                 job.id[:8],
                 settled.status.value,
             )
+
+    def _notify(self, report: Dict[str, Any]) -> None:
+        lease = max(self.settings.stale_after_seconds, MIN_LEASE_SECONDS)
+        try:
+            counts = deliver_notifications(
+                self.store, self.notifier, self.worker_id, lease_seconds=lease
+            )
+        except Exception:  # pragma: no cover - deliver_notifications never raises
+            logger.exception("Notification delivery failed")
+            return
+        for key, value in counts.items():
+            report["notifications"][key] += value
 
     def _cleanup(self, report: Dict[str, Any]) -> None:
         now = self._monotonic()

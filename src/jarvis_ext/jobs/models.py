@@ -233,6 +233,50 @@ class Job:
         }
 
 
+class NotificationState(str, Enum):
+    """Delivery state of a finished job's notification (the outbox row)."""
+
+    PENDING = "pending"  # waiting to be sent (or to be retried)
+    SENDING = "sending"  # claimed by a worker; recovered if it never finishes
+    DELIVERED = "delivered"
+    FAILED = "failed"  # gave up; the job itself is unaffected
+
+
+@dataclass(frozen=True)
+class JobNotification:
+    """The notification owed for one finished job.
+
+    Created in the same transaction as the job's final status, at most once
+    per job (final states are never left).  ``kind`` and ``error_code`` are
+    copied from the job when read, so a notifier needs nothing else.
+    """
+
+    job_id: str
+    kind: str
+    outcome: JobStatus
+    error_code: Optional[str]
+    state: NotificationState
+    attempts: int
+    claimed_by: Optional[str]
+    claimed_at: Optional[str]
+    not_before: Optional[str]
+    last_error: Optional[str]
+    created_at: str
+    updated_at: str
+    delivered_at: Optional[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "outcome": self.outcome.value,
+            "state": self.state.value,
+            "attempts": self.attempts,
+            "last_error": self.last_error,
+            "retry_not_before": self.not_before,
+            "created_at": self.created_at,
+            "delivered_at": self.delivered_at,
+        }
+
+
 @dataclass(frozen=True)
 class JobEvent:
     """One entry in a job's append-only history."""
@@ -252,8 +296,10 @@ __all__ = [
     "JobError",
     "JobEvent",
     "JobNotFoundError",
+    "JobNotification",
     "JobStatus",
     "MAX_ATTEMPTS",
+    "NotificationState",
     "TRANSITIONS",
     "check_transition",
     "encode_json_object",

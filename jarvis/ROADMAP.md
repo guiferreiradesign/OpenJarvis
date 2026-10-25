@@ -107,7 +107,7 @@ Still for you to do:
 Goal: renders (and later other long-running skills) run as **jobs** that
 are tracked from submission to a final status, can be cancelled and
 retried safely, notify you, and support revisions. Approved decisions:
-D19–D24 and D27 in DECISIONS.md; design notes D25–D26 and D28–D30. Details: [jobs.md](jobs.md).
+D19–D24 and D27 in DECISIONS.md; design notes D25–D26 and D28–D31. Details: [jobs.md](jobs.md).
 
 | Step | Scope | Status |
 |---|---|---|
@@ -115,7 +115,7 @@ D19–D24 and D27 in DECISIONS.md; design notes D25–D26 and D28–D30. Details
 | 2 | Single-job runner for `video.render`: calls `media_render` then `media_validate`, classifies failures, retries only temporary ones | **Done** |
 | 3 | Worker and CLI: submit, list, show, cancel; single-worker lock; crash recovery (heartbeat); retry back-off; leftover temp-folder cleanup | **Done** |
 | 4 | Progress from FFmpeg `-progress`, in job status and on the event bus | **Done** |
-| 5 | Notifications on final status: log + macOS | Planned |
+| 5 | Notifications on final status: log + macOS, from a crash-safe outbox | **Done** |
 | 6 | Revisions (complete new plan, child job) and safe reuse of identical finished work | Planned |
 | 7 | Agent tools and documentation, with RBAC tests | Planned |
 

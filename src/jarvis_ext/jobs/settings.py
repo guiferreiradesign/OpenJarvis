@@ -9,6 +9,7 @@
     poll_seconds = 2            # idle worker: how often to look for work
     heartbeat_seconds = 10      # running job: how often the worker reports in
     stale_after_seconds = 120   # no heartbeat for this long: worker presumed dead
+    notifications = "log"       # "log", or "macos" (log + Notification Center)
 
 The database holds job payloads (for video jobs, edit plans with workspace
 paths), so it is kept with OpenJarvis' own state rather than in a media or
@@ -24,6 +25,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 from jarvis_ext.config import ExtensionConfigError, load_extension_section
 from jarvis_ext.jobs.models import MAX_ATTEMPTS
+from jarvis_ext.notify import BACKENDS, DEFAULT_BACKEND
 
 CONFIG_SECTION = "jobs"
 DEFAULT_SUBDIR = "jarvis"
@@ -55,10 +57,12 @@ class JobSettings:
     poll_seconds: float = 2.0
     heartbeat_seconds: float = 10.0
     stale_after_seconds: float = 120.0
+    notifications: str = DEFAULT_BACKEND
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "JobSettings":
-        unknown = sorted(set(section) - {"database_path", "max_attempts", *TIMINGS})
+        known = {"database_path", "max_attempts", "notifications", *TIMINGS}
+        unknown = sorted(set(section) - known)
         if unknown:
             raise ExtensionConfigError(
                 f"Unknown [jarvis.{CONFIG_SECTION}] keys: {', '.join(unknown)}"
@@ -95,7 +99,17 @@ class JobSettings:
             raise ExtensionConfigError(
                 "jobs.stale_after_seconds must be at least 3 × heartbeat_seconds"
             )
-        return cls(database_path=database_path, max_attempts=attempts, **timings)
+        notifications = section.get("notifications", DEFAULT_BACKEND)
+        if notifications not in BACKENDS:
+            raise ExtensionConfigError(
+                f"jobs.notifications must be one of: {', '.join(BACKENDS)}"
+            )
+        return cls(
+            database_path=database_path,
+            max_attempts=attempts,
+            notifications=notifications,
+            **timings,
+        )
 
     @classmethod
     def load(cls, config_path: Optional[Path] = None) -> "JobSettings":

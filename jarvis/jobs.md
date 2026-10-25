@@ -4,17 +4,18 @@ Phase 3 turns long-running work into **jobs**, starting with renders. A job
 is tracked from submission to a final status, can be cancelled, and is
 retried only when that is safe.
 
-**What exists today (steps 1–4):** the job model, its status rules, the
+**What exists today (steps 1–5):** the job model, its status rules, the
 SQLite job store, a runner that executes one `video.render` job through
 the existing render and validate tools, a worker with a `jobs` CLI
-(submit, list, show, cancel, worker), and progress reporting from
-FFmpeg's real encoding position. There is no notification or agent tool
-yet; those are steps 5–7 in [ROADMAP.md](ROADMAP.md). The Phase 2 render
+(submit, list, show, cancel, worker), progress reporting from FFmpeg's
+real encoding position, and a notification for every finished job (log,
+or macOS). Revisions and agent tools are steps 6–7 in
+[ROADMAP.md](ROADMAP.md). The Phase 2 render
 pipeline is unchanged apart from two additive, opt-in hooks: a stoppable
 process runner (D29) and FFmpeg's `-progress` report (D30).
 
 The job layer is shared by every JARVIS skill. It knows nothing about video,
-FFmpeg, HyperFrames or notifications (DECISIONS.md D25):
+FFmpeg or HyperFrames (DECISIONS.md D25); notifications are generic too:
 
 ```
 skill (later: video-editing skill, research, ...)
@@ -277,6 +278,81 @@ from jarvis_ext.jobs.runner import JOB_PROGRESS_EVENT
 get_event_bus().subscribe(JOB_PROGRESS_EVENT, lambda e: print(e.data))
 ```
 
+## Notifications (step 5)
+
+When a job reaches a final status (`succeeded`, `failed`, `cancelled`)
+the worker sends one notification. Progress and stage changes are never
+notified; watch them with `jobs list`/`jobs show` or the event bus.
+
+| Outcome | Title | Message |
+|---|---|---|
+| succeeded | `JARVIS: job succeeded` | `video.render job 1a2b3c4d succeeded.` |
+| failed | `JARVIS: job failed` | `video.render job 1a2b3c4d failed (ffmpeg_failed).` |
+| cancelled | `JARVIS: job cancelled` | `video.render job 1a2b3c4d was cancelled.` |
+
+Messages are built only from validated identifiers: the kind, the first
+8 characters of the id, the outcome and the error **code**. The error
+message, payload (plan) and result are never used, so no path, file name,
+plan content or credential can appear. As a second guard, the text is
+cleaned (control characters removed, anything path-like replaced by
+`[path]`, title ≤ 80 and message ≤ 240 characters).
+
+**Backends** (`[jarvis.jobs] notifications`):
+
+* `log` (default): one INFO line on the `jarvis_ext.notify` logger
+  (the worker logs to stderr). Works everywhere.
+* `macos`: a Notification Center banner via `/usr/bin/osascript`, plus
+  the same log line. The AppleScript is a fixed constant; title and
+  message are passed as arguments to its `run` handler after `--`, so
+  notification text is never parsed as AppleScript. No shell, a minimal
+  environment (`PATH`, `HOME`), no stdin, a 10 s timeout; osascript's
+  output is not logged. If you are not on macOS, or `osascript` is
+  missing, `jobs worker` refuses to start with a clear message instead
+  of silently not notifying. macOS may ask once whether "Script Editor"
+  (osascript) may show notifications; allow it in System Settings →
+  Notifications if no banner appears.
+
+**Delivery (outbox).** Schema v4 adds `job_notifications`, one row per
+finished job (primary key: the job id). The row is inserted in the
+**same transaction** as the final status, so the two commit or roll back
+together: a job cannot finish without owing its notification, and
+cannot owe two. Rows move `pending` → `sending` → `delivered` (or
+`failed`):
+
+1. The worker claims due rows in one `BEGIN IMMEDIATE` transaction
+   (`pending`, or `sending` with an expired lease). Concurrent claimers,
+   in any thread or process, never receive the same row.
+2. It calls the notifier outside any transaction.
+3. It records `delivered`, or a failed attempt: retried after 30 s, at
+   most 3 attempts; errors that cannot get better (not macOS, no
+   osascript) give up at once. Only the claiming worker can record the
+   result.
+
+The worker delivers on start (so a restart sends what a crashed worker
+left behind), after every job, and on each idle poll. Jobs finished by
+recovery or cancelled from the CLI while queued are notified the next
+time a worker polls.
+
+**Guarantee: at least once, not exactly once.** Showing a banner and
+committing to SQLite cannot be one atomic step. If the worker dies after
+claiming a row and before recording the result, the row stays `sending`;
+once its lease (`max(stale_after_seconds, 60)` seconds) expires it is
+sent again. So a crash in the instant between showing a notification and
+recording it gives one duplicate; a crash at any other moment loses
+nothing and duplicates nothing. Recording `delivered` *before* sending
+would turn that duplicate into a lost notification, which is worse for
+"your render is done". Ordinary polling never repeats a notification.
+
+**A notification never affects its job.** Notifier errors, notifier bugs
+and database errors during delivery are logged with a short code (the
+notification text and osascript output are not logged) and the job's
+status, result and history are unchanged. `jobs show` includes the
+notification's state, attempts and last error code.
+
+Other skills get notifications for free by finishing jobs through the
+store. `jarvis_ext.notify` (`Notification`, `make_notifier`) can also be
+used directly; it knows nothing about jobs.
+
 ## Storage and safety
 
 * **Location:** `<OPENJARVIS_HOME>/jarvis/jobs.db` (normally
@@ -290,7 +366,10 @@ get_event_bus().subscribe(JOB_PROGRESS_EVENT, lambda e: print(e.data))
   run while a worker writes. A store object may be shared between threads.
 * **Schema version:** the file is marked as a JARVIS job database
   (`PRAGMA application_id`) with its schema version (`PRAGMA user_version`,
-  currently 2; version 1 files are upgraded in place when opened).
+  currently 4; older files are upgraded in place when opened, in one
+  transaction. The v3 → v4 upgrade adds the notification outbox and
+  creates no rows for jobs that had already finished, so upgrading never
+  announces old work).
   A database from a newer JARVIS, another program's SQLite file, or a file
   that is not a database is refused, and the file is left byte-for-byte
   unchanged. Future upgrades will be numbered migrations applied in one
@@ -311,6 +390,7 @@ Optional. Add to `~/.openjarvis/config.toml` (see
 # poll_seconds = 2            # idle worker: how often it looks for work
 # heartbeat_seconds = 10      # running job: how often the worker reports in
 # stale_after_seconds = 120   # no heartbeat this long: worker presumed dead (≥ 3 × heartbeat)
+# notifications = "log"       # "log", or "macos" (log + Notification Center)
 ```
 
 A custom `database_path` must be absolute, its folder must already exist
@@ -334,8 +414,22 @@ with open_job_store() as store:                  # reads [jarvis.jobs]
 
 ```bash
 uv run pytest tests/jarvis_ext/test_job_store.py tests/jarvis_ext/test_job_runner.py \
-    tests/jarvis_ext/test_job_worker.py tests/jarvis_ext/test_job_progress.py -v
+    tests/jarvis_ext/test_job_worker.py tests/jarvis_ext/test_job_progress.py \
+    tests/jarvis_ext/test_job_notifications.py -v
 ```
+
+`test_job_notifications.py` covers message text for each outcome (and
+that error messages, paths and payloads never appear), text cleaning of
+hostile input, the outbox (one row per final status, none for
+non-final changes, once-only claiming during polling, lease recovery,
+back-off, giving up, ownership), 6 threads with separate connections
+delivering 30 notifications exactly once, the v3 → v4 upgrade, the
+worker (after a job, cancelled jobs, restart recovery, a failing
+notifier never failing a job or stopping the worker), the macOS command
+(fixed script, `--`, argument list, no shell, minimal environment),
+osascript failures, timeouts, a missing or non-executable osascript,
+other platforms, settings and the CLI. An autouse fixture makes any
+attempt to run the real osascript fail the test, so no banner is shown.
 
 `test_job_progress.py` covers parsing FFmpeg's progress report (partial,
 malformed, `N/A`, duplicated, out-of-order and replaced files), the
@@ -396,6 +490,15 @@ claiming across threads and processes, and `[jarvis.jobs]` settings.
 * **Run jobs through the worker.** Calling `run_next` directly, without the
   worker's lock and heartbeat, is for tests: a worker would treat such a
   long-running job as abandoned after `stale_after_seconds`.
-* **No pruning.** Finished jobs and their history are kept indefinitely.
+* **Notifications are at least once.** A worker that dies in the instant
+  between showing a notification and recording it shows it again after
+  restart (once the lease expires). A notification is sent only while a
+  worker runs.
+* **macOS delivery is not confirmed.** osascript exiting 0 means the
+  request was accepted; if notifications are turned off for it in System
+  Settings, nothing appears and JARVIS cannot tell. The log line is
+  always written.
+* **No pruning.** Finished jobs, their history and notification rows are
+  kept indefinitely.
 * **WAL needs a local filesystem.** On a network share SQLite may fall back
   to its rollback journal (logged as a warning); keep the database local.

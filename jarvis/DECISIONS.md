@@ -414,6 +414,39 @@ known render, and the remaining window is documented in jobs.md.
 or dashboard shows; the stage says what it means, and other skills can
 use the same two fields with their own stages.
 
+## D31. Notifications: a transactional outbox, delivered at least once
+
+**Decision:**
+
+* **When:** only final statuses (`succeeded`, `failed`, `cancelled`), for
+  every job kind. No notification for progress or stages.
+* **Outbox:** schema v4 table `job_notifications`, primary key job id,
+  inserted by the store in the same transaction as the final status
+  (every final change goes through one internal method). No backfill
+  for jobs finished before the upgrade.
+* **Delivery:** the worker claims due rows atomically (`sending`, with a
+  lease of `max(stale_after_seconds, 60)` s), sends outside the
+  transaction, then records `delivered` or a failed attempt (30 s
+  back-off, 3 attempts; permanent errors give up at once).
+* **Guarantee:** at least once. A crash between showing and recording
+  can repeat one notification; recording first would lose it instead.
+  Exactly-once is not claimed.
+* **Text:** kind, short id, outcome, error code only; cleaned and bounded
+  again by the notifier.
+* **Backends:** `log` (default) and `macos` (`/usr/bin/osascript`, fixed
+  script, values as `argv` after `--`, no shell, minimal env, timeout).
+  `macos` on another system, or without osascript, stops `jobs worker`
+  at start with a clear error, following the config convention that a
+  setting which cannot be honoured is an error, not a silent no-op.
+* **Isolation:** `jarvis_ext.notify` knows nothing about jobs;
+  `jarvis_ext.jobs.notifications` knows nothing about video. Failures are
+  logged by code and never change a job or stop the worker.
+
+**Why an outbox:** sending straight from the runner would lose the
+notification whenever the worker dies between finishing a job and
+sending, and would need its own duplicate guard. A row written with the
+final status survives crashes and is unique by construction.
+
 ## Assumptions
 
 * Only you (and processes you trust) write to the media workspace. See the

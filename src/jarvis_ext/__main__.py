@@ -18,7 +18,8 @@ validation).  ``PLAN.json`` may be ``-`` to read the plan from stdin.
 ``jobs`` commands print JSON on stdout; errors go to stderr with exit
 status 1.  ``JOB_ID`` may be the first 6+ characters of an id.  The worker
 logs progress to stderr and prints a report when it exits; Ctrl-C (or
-SIGTERM) lets the current job finish, a second one stops it now.
+SIGTERM) lets the current job finish, a second one stops it now.  It sends
+a notification for each finished job (``[jarvis.jobs] notifications``).
 """
 
 from __future__ import annotations
@@ -105,9 +106,11 @@ def _jobs(args: argparse.Namespace) -> int:
             with open_job_store(settings) as store:
                 job = store.find(args.job_id)
                 events = store.events(job.id)
+                notification = store.notification(job.id)
             _print_json(
                 {
                     "job": job.to_dict(),
+                    "notification": notification.to_dict() if notification else None,
                     "events": [
                         {
                             "at": e.at,
@@ -142,8 +145,17 @@ def _jobs(args: argparse.Namespace) -> int:
 def _worker(args: argparse.Namespace, settings: Any) -> int:
     from jarvis_ext.jobs.store import open_job_store
     from jarvis_ext.jobs.worker import Worker, WorkerLockedError
+    from jarvis_ext.notify import NotificationError, make_notifier
     from jarvis_ext.video.render_job import KIND, VideoRenderHandler
 
+    try:
+        notifier = make_notifier(settings.notifications)
+    except NotificationError as exc:
+        print(
+            f"jobs.notifications = {settings.notifications!r} cannot be used: {exc}",
+            file=sys.stderr,
+        )
+        return 1
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -155,6 +167,7 @@ def _worker(args: argparse.Namespace, settings: Any) -> int:
             {KIND: VideoRenderHandler(config_path=args.config)},
             lock_path=settings.lock_file(),
             settings=settings,
+            notifier=notifier,
         )
         signals = {"count": 0}
 

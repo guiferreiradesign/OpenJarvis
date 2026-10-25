@@ -216,7 +216,7 @@ class TestStoreV2:
         conn.commit()
         conn.close()
         with JobStore(path) as upgraded:
-            assert upgraded.schema_version == 3 == max(_MIGRATIONS) + 1
+            assert upgraded.schema_version == 4 == max(_MIGRATIONS) + 1
             (job,) = upgraded.list_jobs()
             assert job.heartbeat_at is None and job.not_before is None
             # A pre-upgrade running job (no heartbeat) counts as stale.

@@ -13,6 +13,9 @@ Differences from the upstream scheduler store, all deliberate:
   version).  A file from a newer JARVIS, or a SQLite file that is not a job
   database, is refused without being modified.
 * WAL journal mode, so readers (status queries) do not block the worker.
+* Every final status also creates the job's row in ``job_notifications``
+  (an outbox) in the same transaction, so a finished job always owes
+  exactly one notification, even if the worker dies right after.
 
 Error messages never contain the database path; they can reach a model
 through tool results (see DECISIONS.md D3).
@@ -42,7 +45,9 @@ from jarvis_ext.jobs.models import (
     JobError,
     JobEvent,
     JobNotFoundError,
+    JobNotification,
     JobStatus,
+    NotificationState,
     check_transition,
     clean_error_message,
     clean_progress,
@@ -59,12 +64,18 @@ logger = logging.getLogger(__name__)
 MAX_NOTE_CHARS = 500
 _ID_PREFIX_RE = re.compile(r"^[0-9a-fA-F]{6,32}$")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MAX_RETRY_DELAY_SECONDS = 86400.0
+# Notification delivery: attempts per job (a failed attempt is retried after
+# NOTIFICATION_RETRY_SECONDS) before the notification is given up.
+MAX_NOTIFICATION_ATTEMPTS = 3
+NOTIFICATION_RETRY_SECONDS = 30.0
 # "JRVJ" — marks the file as a JARVIS job database (PRAGMA application_id).
 APPLICATION_ID = 0x4A52564A
 
 _STATUS_VALUES = ", ".join(f"'{s.value}'" for s in JobStatus)
+_FINAL_VALUES = ", ".join(f"'{s.value}'" for s in JobStatus if s.is_final)
+_NOTIFY_VALUES = ", ".join(f"'{s.value}'" for s in NotificationState)
 
 _SCHEMA_V1 = (
     f"""
@@ -117,6 +128,27 @@ _MIGRATIONS: dict = {
     2: (
         "ALTER TABLE jobs ADD COLUMN progress REAL",
         "ALTER TABLE jobs ADD COLUMN stage TEXT",
+    ),
+    # Phase 3 step 5: notification outbox, one row per finished job.  Jobs
+    # that finished before the upgrade get no row: nobody is notified
+    # about old work when the database is upgraded.
+    3: (
+        f"""
+        CREATE TABLE job_notifications (
+            job_id       TEXT PRIMARY KEY REFERENCES jobs(id),
+            outcome      TEXT NOT NULL CHECK (outcome IN ({_FINAL_VALUES})),
+            state        TEXT NOT NULL CHECK (state IN ({_NOTIFY_VALUES})),
+            attempts     INTEGER NOT NULL DEFAULT 0,
+            claimed_by   TEXT,
+            claimed_at   TEXT,
+            not_before   TEXT,
+            last_error   TEXT,
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL,
+            delivered_at TEXT
+        )
+        """,
+        "CREATE INDEX job_notifications_state ON job_notifications (state, created_at)",
     ),
 }
 
@@ -623,6 +655,153 @@ class JobStore:
     def _after(self, seconds: float) -> Optional[str]:
         return _shift(self._clock(), seconds) if seconds > 0 else None
 
+    # -- notifications (outbox) ----------------------------------------------
+
+    def notification(self, job_id: str) -> Optional[JobNotification]:
+        """The notification owed for a finished job (``None`` if not final)."""
+        with self._read() as conn:
+            self._get(conn, job_id)
+            row = conn.execute(
+                _NOTIFICATION_SELECT + "WHERE n.job_id = ?", (job_id,)
+            ).fetchone()
+        return _row_to_notification(row) if row is not None else None
+
+    def claim_notifications(
+        self, worker_id: str, *, lease_before: str, limit: int = 20
+    ) -> List[JobNotification]:
+        """Atomically take due notifications for sending, oldest first.
+
+        Due means ``pending`` (and past its retry back-off), or ``sending``
+        with a claim older than *lease_before*: its sender died between
+        claiming and recording the result, so it may or may not have been
+        shown; it is sent again (at-least-once, see jobs.md).  One that has
+        used all its attempts is given up instead.  Concurrent claimers in
+        any thread or process always receive different rows.
+        """
+        validate_worker_id(worker_id)
+        claimed: List[JobNotification] = []
+        with self._write() as conn:
+            now = self._clock()
+            rows = conn.execute(
+                "SELECT job_id, state, attempts FROM job_notifications "
+                "WHERE (state = ? AND (not_before IS NULL OR not_before <= ?)) "
+                "OR (state = ? AND claimed_at < ?) "
+                "ORDER BY created_at, rowid LIMIT ?",
+                (
+                    NotificationState.PENDING.value,
+                    now,
+                    NotificationState.SENDING.value,
+                    lease_before,
+                    max(0, int(limit)),
+                ),
+            ).fetchall()
+            for row in rows:
+                if row["attempts"] >= MAX_NOTIFICATION_ATTEMPTS:
+                    conn.execute(
+                        "UPDATE job_notifications SET state = ?, last_error = ?, "
+                        "claimed_by = NULL, claimed_at = NULL, updated_at = ? "
+                        "WHERE job_id = ? AND state = ?",
+                        (
+                            NotificationState.FAILED.value,
+                            "abandoned",
+                            now,
+                            row["job_id"],
+                            row["state"],
+                        ),
+                    )
+                    continue
+                conn.execute(
+                    "UPDATE job_notifications SET state = ?, claimed_by = ?, "
+                    "claimed_at = ?, attempts = attempts + 1, not_before = NULL, "
+                    "updated_at = ? WHERE job_id = ? AND state = ?",
+                    (
+                        NotificationState.SENDING.value,
+                        worker_id,
+                        now,
+                        now,
+                        row["job_id"],
+                        row["state"],
+                    ),
+                )
+                claimed.append(
+                    _row_to_notification(
+                        conn.execute(
+                            _NOTIFICATION_SELECT + "WHERE n.job_id = ?",
+                            (row["job_id"],),
+                        ).fetchone()
+                    )
+                )
+        return claimed
+
+    def notification_delivered(self, job_id: str, worker_id: str) -> bool:
+        """Record that *worker_id* showed the notification it claimed.
+
+        Returns ``False`` (and changes nothing) if the claim is no longer
+        this worker's, for example because its lease expired.
+        """
+        validate_worker_id(worker_id)
+        with self._write() as conn:
+            now = self._clock()
+            cursor = conn.execute(
+                "UPDATE job_notifications SET state = ?, delivered_at = ?, "
+                "claimed_at = NULL, last_error = NULL, updated_at = ? "
+                "WHERE job_id = ? AND state = ? AND claimed_by = ?",
+                (
+                    NotificationState.DELIVERED.value,
+                    now,
+                    now,
+                    job_id,
+                    NotificationState.SENDING.value,
+                    worker_id,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def notification_failed(
+        self,
+        job_id: str,
+        worker_id: str,
+        error_code: str,
+        *,
+        retryable: bool = True,
+        delay_seconds: float = NOTIFICATION_RETRY_SECONDS,
+    ) -> Optional[JobNotification]:
+        """Record a failed attempt: retry later if allowed, otherwise give up.
+
+        The job is never touched.  Returns the updated notification, or
+        ``None`` if the claim is no longer this worker's.
+        """
+        validate_worker_id(worker_id)
+        code = validate_error_code(error_code)
+        delay = _check_delay(delay_seconds)
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT attempts FROM job_notifications "
+                "WHERE job_id = ? AND state = ? AND claimed_by = ?",
+                (job_id, NotificationState.SENDING.value, worker_id),
+            ).fetchone()
+            if row is None:
+                return None
+            retry = retryable and row["attempts"] < MAX_NOTIFICATION_ATTEMPTS
+            state = NotificationState.PENDING if retry else NotificationState.FAILED
+            conn.execute(
+                "UPDATE job_notifications SET state = ?, last_error = ?, "
+                "claimed_at = NULL, not_before = ?, updated_at = ? "
+                "WHERE job_id = ?",
+                (
+                    state.value,
+                    code,
+                    self._after(delay) if retry else None,
+                    self._clock(),
+                    job_id,
+                ),
+            )
+            return _row_to_notification(
+                conn.execute(
+                    _NOTIFICATION_SELECT + "WHERE n.job_id = ?", (job_id,)
+                ).fetchone()
+            )
+
     # -- user operations -----------------------------------------------------
 
     def cancel(self, job_id: str) -> Job:
@@ -700,6 +879,16 @@ class JobStore:
         if cursor.rowcount != 1:  # pragma: no cover - guarded by the write lock
             raise InvalidTransitionError("The job changed during the update")
         self._event(conn, job.id, job.status, target, note, now)
+        if target.is_final:
+            # The outbox row commits (or rolls back) with the final status.
+            # OR IGNORE: a final job is never re-finished, but should that
+            # ever happen the first outcome's notification is kept.
+            conn.execute(
+                "INSERT OR IGNORE INTO job_notifications "
+                "(job_id, outcome, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (job.id, target.value, NotificationState.PENDING.value, now, now),
+            )
         return self._get(conn, job.id)
 
     @staticmethod
@@ -905,6 +1094,30 @@ def _row_to_job(row: sqlite3.Row) -> Job:
     )
 
 
+_NOTIFICATION_SELECT = (
+    "SELECT n.*, j.kind AS kind, j.error_code AS error_code "
+    "FROM job_notifications n JOIN jobs j ON j.id = n.job_id "
+)
+
+
+def _row_to_notification(row: sqlite3.Row) -> JobNotification:
+    return JobNotification(
+        job_id=row["job_id"],
+        kind=row["kind"],
+        outcome=JobStatus(row["outcome"]),
+        error_code=row["error_code"],
+        state=NotificationState(row["state"]),
+        attempts=row["attempts"],
+        claimed_by=row["claimed_by"],
+        claimed_at=row["claimed_at"],
+        not_before=row["not_before"],
+        last_error=row["last_error"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        delivered_at=row["delivered_at"],
+    )
+
+
 def open_job_store(
     settings: Optional[JobSettings] = None, *, config_path: Optional[Path] = None
 ) -> JobStore:
@@ -933,6 +1146,8 @@ __all__ = [
     "APPLICATION_ID",
     "JobStore",
     "JobStoreError",
+    "MAX_NOTIFICATION_ATTEMPTS",
+    "NOTIFICATION_RETRY_SECONDS",
     "SCHEMA_VERSION",
     "SchemaVersionError",
     "open_job_store",
