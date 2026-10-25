@@ -4,12 +4,13 @@ Adjusted after the Phase 1 audit (AUDIT.md). Each phase should end with
 something working and tested before the next phase starts. "Reuse" lists the
 upstream parts to build on rather than rebuild.
 
-## Phase 1: foundation (done in this branch)
+## Phase 1: foundation (done; verified on the Mac 2026-10-25)
 
 * Audit of OpenJarvis, plus extension pattern (`src/jarvis_ext`, `[jarvis.*]` config).
 * `media_workspace_inspect`: read-only, sandboxed listing and ffprobe metadata.
 * Tests (mocked and real FFmpeg) and documentation.
-* **Still to do on the Mac:** the checklist below.
+* Mac verification: see the checklist status below. Items 4–6 are deferred,
+  not blocking.
 
 ## Phase 2: deterministic local video pipeline
 
@@ -105,11 +106,12 @@ pipeline.
 Nothing below could be run from the cloud container.
 
 **Status 2026-10-25** (macOS 26.5.1, arm64, uv 0.13.5, Python 3.13.17,
-FFmpeg 9.0.2):
+FFmpeg 9.0.2, Rust 1.99.1 via Homebrew rustup):
 
-* 1–2 done. 116 of 117 tests pass. The one failure is the RBAC test, which
-  needs the Rust extension (`rustup` + `maturin develop`, not installed).
-  `test_unreadable_directory` ran and passed.
+* 1–2 done. All 117 `tests/jarvis_ext` tests pass once the Rust extension
+  is built, including RBAC enforcement and `test_unreadable_directory`.
+  `tests/security` gives 617 passed and 13 skipped; the skips are for
+  missing server/crypto extras, not JARVIS.
 * 3 done on three real HEVC clips in `~/Movies/JARVIS-Test-Media`: one
   iPhone 17 Pro portrait clip (Dolby Vision, 10-bit) and two iPad
   landscape clips. Resolution, orientation, codecs, audio format and

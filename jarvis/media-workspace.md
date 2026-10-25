@@ -134,8 +134,8 @@ into account. One bad file never fails the whole call.
 
 * **macOS status.** The test suite passes on macOS 26.5.1 (Apple Silicon,
   Python 3.13 via uv, Homebrew FFmpeg 9.0.2), including real-ffprobe,
-  FIFO, unreadable-directory and symlink tests. The exception is the RBAC
-  test, which needs the Rust extension. FFmpeg 9 reports
+  FIFO, unreadable-directory, symlink and RBAC tests (RBAC needs the
+  compiled Rust extension; see README.md). FFmpeg 9 reports
   `-display_rotation 90` as `+90` (FFmpeg 6: `-90`); both are treated as
   portrait. Real iPhone/iPad footage matched QuickTime's Inspector (see
   [ROADMAP.md](ROADMAP.md)). The tested iPhone 17 Pro clip stores portrait

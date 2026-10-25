@@ -89,8 +89,11 @@ The fork touches upstream files in exactly two places:
 ## Quick start
 
 ```bash
-brew install uv ffmpeg                    # macOS prerequisites
+brew install uv ffmpeg rustup             # macOS prerequisites
+export PATH="/opt/homebrew/opt/rustup/bin:$PATH"   # rustup is keg-only
+rustup default stable                     # Rust >= 1.89
 uv sync --extra dev                       # install (Python 3.10–3.13)
+uv run maturin develop --release --manifest-path rust/crates/openjarvis-python/Cargo.toml
 cat >> ~/.openjarvis/config.toml <<'EOF'
 [jarvis.media_workspace]
 root = "/Users/you/Movies/JARVIS"         # a dedicated folder, not your home dir
@@ -120,12 +123,14 @@ uv run pytest tests/jarvis_ext -v
 ```
 
 The real-FFmpeg tests skip automatically if `ffmpeg`/`ffprobe` are missing.
-`test_executor_enforces_file_read_capability` fails with
-`No module named 'openjarvis_rust'` unless the Rust extension is built
-(`CapabilityPolicy` has no Python fallback), so a fresh `uv sync` alone gives
-one failure. Building it needs a Rust toolchain (`rustup`) plus the `maturin
-develop` step below. Some of the wider OpenJarvis suite also needs the
-compiled Rust extension and the server extras, as in CI:
+The compiled Rust extension (`openjarvis_rust`, built by the `maturin
+develop` step above) is **required**, not optional. It has no Python fallback.
+Without it, `test_executor_enforces_file_read_capability` fails, and so
+does a real agent run, because the RBAC policy, rate limiter,
+injection/secret scanners, SSRF and file policies, `think` and `file_read`
+all load it. The standalone `python -m jarvis_ext` runner does not need it.
+Rebuild it after pulling upstream Rust changes. The wider OpenJarvis suite
+also needs the server extras, as in CI:
 
 ```bash
 uv sync --extra dev --extra framework-comparison --extra server --extra inference-cloud
