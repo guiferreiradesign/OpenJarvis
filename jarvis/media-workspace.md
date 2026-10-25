@@ -127,13 +127,31 @@ into account. One bad file never fails the whole call.
 | Shell injection | ffprobe runs from an argument list with no shell. The path is passed as `file:<absolute path>`, so names starting with `-` or containing `:` cannot be read as options or protocols |
 | Crafted media making ffprobe fetch URLs or other files (for example an HLS playlist renamed `.mp4`) | `-protocol_whitelist file` and a demuxer `-format_whitelist` that excludes playlist/indirection formats (hls, concat, image2...). Verified against real ffprobe |
 | Hangs (huge files, FIFOs, slow network drives) | Non-regular files are skipped. 15 s per-file timeout, 60 s total budget, and the OpenJarvis executor timeout as a backstop |
-| Leaking paths or untrusted text to the model | Only workspace-relative paths are returned; ffprobe errors are trimmed and absolute paths stripped. Free-text tags (title, comment) are never returned, and codec strings are reduced to a safe character set. **File names themselves are untrusted** and the tool description tells the model so |
+| Leaking paths or untrusted text to the model | Only workspace-relative paths are returned; ffprobe errors are trimmed and absolute paths stripped; config-file errors name only the file (`config.toml`). Free-text tags (title, comment) are never returned, and codec strings are reduced to a safe character set. **File names themselves are untrusted** and the tool description tells the model so |
 | Permission control | `ToolSpec.required_capabilities = ["file:read"]`, enforced by OpenJarvis RBAC when a capability policy is active (tested) |
 
 ## Known limitations
 
-* **Not yet run on macOS.** Everything was tested on Linux in the cloud
-  container (FFmpeg 6.1.1). See the Mac checklist in [ROADMAP.md](ROADMAP.md).
+* **macOS status.** The test suite passes on macOS 26.5.1 (Apple Silicon,
+  Python 3.13 via uv, Homebrew FFmpeg 9.0.2), including real-ffprobe,
+  FIFO, unreadable-directory and symlink tests. The exception is the RBAC
+  test, which needs the Rust extension. FFmpeg 9 reports
+  `-display_rotation 90` as `+90` (FFmpeg 6: `-90`); both are treated as
+  portrait. Real iPhone/iPad footage matched QuickTime's Inspector (see
+  [ROADMAP.md](ROADMAP.md)). The tested iPhone 17 Pro clip stores portrait
+  natively (1080×1920, no rotation matrix), so the rotation-swap path has
+  only been exercised with generated rotated files.
+* **Frame rate is an average.** `frame_rate` is ffprobe's `avg_frame_rate`.
+  For variable-frame-rate phone footage it can differ from QuickTime's
+  "Encoded FPS". For example, a 60 fps iPhone clip with dropped frames shows
+  59.891 here and 59.98 in QuickTime, and a 30 fps iPad clip shows 30.032
+  versus 30.03. Phase 2 rendering should choose an explicit output rate
+  rather than copying this value.
+* **Case-insensitive subpaths echo the request.** On APFS,
+  `subpath="CLIP.MOV"` finds `clip.mov` but reports the path as spelled in
+  the request. Phase 2 should normalise to the on-disk name.
+* Location and other QuickTime metadata tags (GPS, device model, creation
+  date) are deliberately not returned.
 * **Time-of-check/time-of-use.** A process that can write to the workspace
   could swap a file for an escaping symlink between the final check and the
   ffprobe call. The window is tiny and the worst outcome is ffprobe reading

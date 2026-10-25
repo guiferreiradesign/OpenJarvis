@@ -54,12 +54,19 @@ def load_extension_section(name: str, path: Optional[Path] = None) -> Dict[str, 
     config_path = resolve_config_path(path)
     if not config_path.exists():
         return {}
+    # The message reaches the model through tool results, so it names only the
+    # file, never its absolute path; the full path goes to the local log.
     try:
         with open(config_path, "rb") as fh:
             data = tomllib.load(fh)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+    except OSError as exc:
+        logger.warning("Cannot read JARVIS config %s: %s", config_path, exc)
+        reason = exc.strerror or type(exc).__name__
+        raise ExtensionConfigError(f"Cannot read {config_path.name}: {reason}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        logger.warning("Invalid TOML in JARVIS config %s: %s", config_path, exc)
         raise ExtensionConfigError(
-            f"Cannot read JARVIS config from {config_path}: {exc}"
+            f"Invalid TOML in {config_path.name}: {exc}"
         ) from exc
 
     root = data.get(SECTION_ROOT, {})

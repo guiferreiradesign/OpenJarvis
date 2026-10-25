@@ -42,8 +42,19 @@ class TestLoadExtensionSection:
 
     def test_malformed_toml_raises(self, tmp_path):
         path = _write(tmp_path, "[jarvis.media_workspace\nroot = ")
-        with pytest.raises(ExtensionConfigError):
+        with pytest.raises(ExtensionConfigError) as info:
             load_extension_section("media_workspace", path)
+        # Config errors reach the model; they must not reveal absolute paths.
+        assert "config.toml" in str(info.value)
+        assert str(tmp_path) not in str(info.value)
+
+    def test_unreadable_file_error_hides_path(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.mkdir()  # opening a directory fails with an OSError naming the path
+        with pytest.raises(ExtensionConfigError) as info:
+            load_extension_section("media_workspace", path)
+        assert "config.toml" in str(info.value)
+        assert str(tmp_path) not in str(info.value)
 
     @pytest.mark.parametrize(
         "text",

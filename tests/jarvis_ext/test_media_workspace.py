@@ -263,6 +263,14 @@ class TestConfigurationStates:
         assert "configuration error" in result.content
         assert "absolute" in result.content
 
+    def test_malformed_config_error_hides_path(self, tmp_path):
+        config = tmp_path / "config.toml"
+        config.write_text("[jarvis.media_workspace\n")
+        result = MediaWorkspaceInspectTool(config_path=config).execute()
+        assert not result.success
+        assert "configuration error" in result.content
+        assert str(tmp_path) not in result.content
+
     def test_missing_root_is_graceful_and_hides_path(self, tmp_path):
         missing = tmp_path / "unplugged-drive"
         result = _tool(missing).execute()

@@ -71,7 +71,7 @@ The fork touches upstream files in exactly two places:
 
 | Capability | Status | Notes |
 |---|---|---|
-| Media-workspace inspection (list + ffprobe metadata) | **Implemented** (JARVIS) | Tested in the cloud container with real FFmpeg 6.1; not yet run on the Mac |
+| Media-workspace inspection (list + ffprobe metadata) | **Implemented** (JARVIS) | Tested with real FFmpeg 6.1 (Linux) and FFmpeg 9.0.2 on macOS 26.5 (Apple Silicon), including real iPhone/iPad footage checked against QuickTime |
 | Text chat, multi-step tool use | **Available upstream** | Needs an inference engine (local Ollama or an API key) |
 | Restricted file read/write | **Available upstream** | `file_read` / `file_write` + `[security] allowed_dirs` |
 | Shell execution | **Available upstream, deliberately not enabled** | `shell_exec` has no allowlist; see AUDIT.md |
@@ -89,6 +89,7 @@ The fork touches upstream files in exactly two places:
 ## Quick start
 
 ```bash
+brew install uv ffmpeg                    # macOS prerequisites
 uv sync --extra dev                       # install (Python 3.10–3.13)
 cat >> ~/.openjarvis/config.toml <<'EOF'
 [jarvis.media_workspace]
@@ -119,8 +120,12 @@ uv run pytest tests/jarvis_ext -v
 ```
 
 The real-FFmpeg tests skip automatically if `ffmpeg`/`ffprobe` are missing.
-Some of the wider OpenJarvis suite needs the compiled Rust extension and the
-server extras, as in CI:
+`test_executor_enforces_file_read_capability` fails with
+`No module named 'openjarvis_rust'` unless the Rust extension is built
+(`CapabilityPolicy` has no Python fallback), so a fresh `uv sync` alone gives
+one failure. Building it needs a Rust toolchain (`rustup`) plus the `maturin
+develop` step below. Some of the wider OpenJarvis suite also needs the
+compiled Rust extension and the server extras, as in CI:
 
 ```bash
 uv sync --extra dev --extra framework-comparison --extra server --extra inference-cloud

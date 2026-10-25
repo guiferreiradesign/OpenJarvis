@@ -104,6 +104,23 @@ pipeline.
 
 Nothing below could be run from the cloud container.
 
+**Status 2026-10-25** (macOS 26.5.1, arm64, uv 0.13.5, Python 3.13.17,
+FFmpeg 9.0.2):
+
+* 1–2 done. 116 of 117 tests pass. The one failure is the RBAC test, which
+  needs the Rust extension (`rustup` + `maturin develop`, not installed).
+  `test_unreadable_directory` ran and passed.
+* 3 done on three real HEVC clips in `~/Movies/JARVIS-Test-Media`: one
+  iPhone 17 Pro portrait clip (Dolby Vision, 10-bit) and two iPad
+  landscape clips. Resolution, orientation, codecs, audio format and
+  duration match QuickTime's Inspector and AVFoundation. Frame rates differ
+  slightly for variable-frame-rate clips (see media-workspace.md). The
+  source files' SHA-256 hashes, sizes and mtimes were unchanged afterwards.
+  No real audio-only file was tested.
+* 4–5 not done (no external drive or iCloud folder used).
+* 6 skipped: no local inference engine is installed. Apple FM needs a full
+  Xcode for `apple-fm-sdk`.
+
 1. `brew install ffmpeg uv`, clone the fork, `uv sync --extra dev`.
 2. `uv run pytest tests/jarvis_ext -v`. Expect everything to pass,
    including `TestRealFfprobe` and `test_unreadable_directory`. The latter

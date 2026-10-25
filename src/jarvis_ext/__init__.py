@@ -7,7 +7,7 @@ only coupling to the core is one guarded import at the end of
 
 Extensions plug in through the standard OpenJarvis registries (currently
 ``ToolRegistry``) and read their settings from ``[jarvis.*]`` sections of the
-normal OpenJarvis ``config.toml``.  See ``docs/jarvis/README.md``.
+normal OpenJarvis ``config.toml``.  See ``jarvis/README.md``.
 """
 
 from __future__ import annotations
