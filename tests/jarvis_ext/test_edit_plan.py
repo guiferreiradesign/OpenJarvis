@@ -433,6 +433,26 @@ class TestChecks:
                 "pixel_format",
             ),
             (
+                {"width": 1080, "height": 1920, "color_range": "pc"},
+                100,
+                "color_range",
+            ),
+            (
+                {"width": 1080, "height": 1920, "color_range": None},
+                100,
+                "color_range",
+            ),
+            (
+                {
+                    "width": 1080,
+                    "height": 1920,
+                    "color_transfer": "arib-std-b67",
+                    "color_primaries": "bt2020",
+                },
+                100,
+                "color_metadata",
+            ),
+            (
                 {"width": 1080, "height": 1920, "container": "matroska,webm"},
                 100,
                 "container",

@@ -38,8 +38,10 @@ from jarvis_ext.video.ffmpeg import (
     RENDER_FILENAME,
     SUBTITLE_FILENAME,
     ClipInput,
+    FfmpegCapabilities,
     LogoInput,
     build_render_command,
+    hdr_name,
     log_tail,
     minimal_env,
     png_dimensions,
@@ -65,7 +67,6 @@ MAX_LOGO_PIXELS = 8192
 # Allow tiny container/stream rounding when comparing an out-point with the
 # probed source duration.
 _END_EPSILON = 0.001
-_HIGH_BIT_DEPTH = ("10", "12", "16")
 
 
 class MediaRenderTool(VideoToolBase):
@@ -174,7 +175,12 @@ class MediaRenderTool(VideoToolBase):
         return real
 
     def _resolve_clips(
-        self, plan: EditPlan, root: Path, ffprobe: str, warnings: List[str]
+        self,
+        plan: EditPlan,
+        root: Path,
+        ffprobe: str,
+        capabilities: FfmpegCapabilities,
+        warnings: List[str],
     ) -> List[ClipInput]:
         probes: Dict[Path, Dict[str, Any]] = {}
         resolved: List[ClipInput] = []
@@ -199,13 +205,6 @@ class MediaRenderTool(VideoToolBase):
                     min(self._workspace.ffprobe_timeout_seconds, remaining),
                     self._runner,
                 )
-                video = probes[real].get("video") or {}
-                pix = video.get("pixel_format") or ""
-                if any(depth in pix for depth in _HIGH_BIT_DEPTH):
-                    warnings.append(
-                        f"{clip.source}: {pix} source (likely HDR); converted to "
-                        "8-bit SDR without tone mapping, colours may look flat."
-                    )
             meta = probes[real]
             if meta.get("status") != "ok":
                 detail = meta.get("error") or meta.get("status")
@@ -226,14 +225,31 @@ class MediaRenderTool(VideoToolBase):
             has_audio = "audio" in meta
             if plan.audio_mode == "keep" and not has_audio:
                 warnings.append(f"{clip.source} has no audio; silence is used.")
-            resolved.append(
-                ClipInput(
-                    path=real,
-                    start=clip.start,
-                    duration=clip.duration,
-                    has_audio=has_audio,
-                )
+            item = ClipInput(
+                path=real,
+                start=clip.start,
+                duration=clip.duration,
+                has_audio=has_audio,
+                color_transfer=meta["video"].get("color_transfer"),
             )
+            if item.hdr:
+                kind = hdr_name(item.color_transfer)
+                if not capabilities.tone_mapping:
+                    raise Refused(
+                        "unsupported",
+                        f"{label}: {clip.source} is {kind} HDR, and this FFmpeg "
+                        "cannot tone-map HDR to SDR (its scale filter lacks "
+                        "colour management or the perceptual intent). Remove "
+                        "the clip or use an FFmpeg that supports it; it is not "
+                        "relabelled as SDR.",
+                    )
+                note = (
+                    f"{clip.source}: {kind} HDR source tone-mapped to SDR Rec.709 "
+                    "with FFmpeg's perceptual mapping; review its colours."
+                )
+                if note not in warnings:
+                    warnings.append(note)
+            resolved.append(item)
         return resolved
 
     def _load_subtitles(
@@ -328,7 +344,7 @@ class MediaRenderTool(VideoToolBase):
                     "unsupported",
                     "This FFmpeg build lacks: " + ", ".join(missing) + "." + hint,
                 )
-            clips = self._resolve_clips(plan, root, ffprobe, warnings)
+            clips = self._resolve_clips(plan, root, ffprobe, capabilities, warnings)
             subtitles = self._load_subtitles(plan, root, warnings)
             logo = self._load_logo(plan)
         except Refused as exc:
@@ -339,7 +355,9 @@ class MediaRenderTool(VideoToolBase):
             temp_dir = folder.make_temp_dir()
             if subtitles is not None:
                 (temp_dir / SUBTITLE_FILENAME).write_text(subtitles, encoding="utf-8")
-            cmd = build_render_command(ffmpeg, plan, clips, logo=logo)
+            cmd = build_render_command(
+                ffmpeg, plan, clips, logo=logo, capabilities=capabilities
+            )
             try:
                 code = self._process_runner(
                     cmd,

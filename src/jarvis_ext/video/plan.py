@@ -225,6 +225,13 @@ class EditPlan:
                 "codec": "h264",
                 "crf": self.crf,
                 "x264_preset": self.x264_preset,
+                "pixel_format": "yuv420p",
+                "color": {
+                    "range": "tv",
+                    "primaries": "bt709",
+                    "transfer": "bt709",
+                    "space": "bt709",
+                },
             },
             "audio": {
                 "mode": self.audio_mode,

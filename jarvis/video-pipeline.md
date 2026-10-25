@@ -145,6 +145,28 @@ fails instead of being ignored. A complete example is in
 The total duration (the sum of clip lengths) must not exceed the preset's
 `max_duration_seconds` or `max_output_seconds`.
 
+## Colour
+
+Every render is SDR **Rec.709, limited ("TV") range, 8-bit 4:2:0**, and is
+tagged that way. The tags are accurate because each clip is converted in
+its own `scale` step, not just relabelled:
+
+| Source | What happens |
+|---|---|
+| SDR, limited range (most cameras) | Scaled; colour unchanged |
+| SDR, **full range** (`yuvj420p`, many iPhone/iPad clips) | Pixel values rescaled to limited range (black 0→16, white 255→235). Before this fix such clips produced a full-range output, which the pre-publish check rejected |
+| SDR with other primaries/matrix | Converted to Rec.709 when the scale filter supports colour management; otherwise only the matrix and range are converted |
+| **HDR** (HLG `arib-std-b67` or PQ `smpte2084`, e.g. iPhone HDR video) | Tone-mapped to SDR Rec.709 with swscale's **perceptual** intent (`scale=…:intent=perceptual`). The render adds a warning asking you to review its colours. Tested on real HLG footage only; see limitations |
+| HDR, but FFmpeg cannot tone-map | **Refused** (`unsupported`), never relabelled as SDR |
+
+The tool decides from `ffmpeg -h filter=scale`. Colour management needs
+`out_primaries`/`out_transfer`; tone mapping also needs the `intent`
+option and the HLG/PQ transfers. Detection is by these options, not by
+version number. Homebrew FFmpeg 9.0.2 has all of them.
+`zscale` is not needed. Note that in a `-filter_complex` graph the
+command-line `-intent` option is ignored, so the intent is set inside the
+`scale` filter.
+
 ## Rendering a video
 
 **Command line (no LLM needed):**
@@ -228,7 +250,8 @@ propagates.
     {"check": "non_empty"}, {"check": "probe"}, {"check": "container"},
     {"check": "duration"}, {"check": "video_duration"}, {"check": "audio_duration"},
     {"check": "video_stream"}, {"check": "dimensions"}, {"check": "frame_rate"},
-    {"check": "video_codec"}, {"check": "pixel_format"}, {"check": "audio_stream"},
+    {"check": "video_codec"}, {"check": "color_range"}, {"check": "color_metadata"},
+    {"check": "pixel_format"}, {"check": "audio_stream"},
     {"check": "audio_codec"}, {"check": "audio_sample_rate"},
     {"check": "subtitle_track"}, {"check": "decodes_cleanly"}
   ],
@@ -248,6 +271,7 @@ propagates.
 | `dimensions` | Exactly the preset size, no rotation flag |
 | `frame_rate` | Within 0.05 fps of the plan |
 | `video_codec`, `pixel_format` | `h264`, `yuv420p` |
+| `color_range`, `color_metadata` | Limited (`tv`) range; primaries, transfer and matrix all `bt709` |
 | `audio_stream`, `audio_codec`, `audio_sample_rate` | AAC 48 kHz present when `audio.mode = keep`; absent when `none` |
 | `subtitle_track` | A subtitle stream exists when `subtitles.mode = embed` |
 | `decodes_cleanly` | `ffmpeg -xerror` decodes every frame (only run when the checks above pass) |
@@ -362,16 +386,17 @@ uv run pytest tests/jarvis_ext -k "Real" -v       # only the real-FFmpeg integra
 | `test_media_render.py` | Tool registration, zero-argument construction, RBAC `file:write` enforcement, executor confirmation, mocked render success/failure/timeout/interrupt, traversal and symlink escapes (clips, subtitles, logo), output overlapping the workspace, missing FFmpeg, burn-in availability, sanitised subtitles, bad outputs never published, validation (tampered, truncated, wrong metadata, decode failure, preview failure, bad names, symlinked output), CLI. **Real FFmpeg:** full plan (crop, logo, embedded subtitles) rendered and validated, then checked independently with ffprobe; pad + no audio + 25 fps + versioning; 3 parallel renders; a real timeout; a corrupted render caught by checksum and, separately, by the decode pass; truncated sources never published. Source files hashed before/after |
 
 **Results on this Mac** (macOS 26.5.1 arm64, Python 3.13.17, FFmpeg 9.0.2,
-2026-10-25): `uv run pytest tests/jarvis_ext` gives **372 passed, 0 skipped**
+2026-10-25): `uv run pytest tests/jarvis_ext` gives **388 passed, 0 skipped**
 (117 Phase 1 + 255 Phase 2). See [ROADMAP.md](ROADMAP.md) for the wider
 suite.
 
 ## Known limitations
 
-* **Not yet verified on real footage.** Every real render so far used
-  synthetic FFmpeg test media. Framing, cut accuracy and A/V sync on real
-  iPhone/iPad clips, and Instagram's acceptance of the output, are
-  unverified. See the Phase 2 checklist in [ROADMAP.md](ROADMAP.md).
+* **Real footage: one technical test so far.** A 15 s reel from three real
+  iPhone/iPad clips (two full-range SDR landscape, one HLG HDR portrait)
+  rendered and validated; see [ROADMAP.md](ROADMAP.md). Cut accuracy and
+  A/V sync were not measured frame by frame, and Instagram's acceptance of
+  the output is unverified.
 * **External drives are untested.** An output folder on an external or
   exFAT drive (no hard links, so the `O_EXCL` reservation fallback is
   used) has only been exercised with mocked `link(2)` failures. A
@@ -383,10 +408,20 @@ suite.
   FFmpeg with libass. Getting one means installing different software
   (not done; needs your approval). The burn-in path is covered only by
   mocked tests.
-* **HDR / 10-bit sources** (iPhone Dolby Vision HEVC) are converted to 8-bit
-  SDR **without tone mapping**, because this FFmpeg lacks `zscale`. Colours
-  may look flat or washed out. The render adds a warning for such clips.
-  Not yet tested on real iPhone footage.
+* **HDR tone mapping: what is and is not verified.** HLG and PQ sources
+  are tone-mapped by FFmpeg's swscale perceptual intent (see "Colour"
+  above); the quality is FFmpeg's, not JARVIS's.
+  * Verified: one real iPhone HLG/BT.2020 clip, checked by eye only (it
+    looked natural); a generated HLG clip in the automated tests, which
+    only proves the pixels were converted, not that they look right.
+  * Not verified: PQ (`smpte2084`) footage (only the generated command is
+    tested), HDR from other phones or cameras, other HLG scenes (very
+    bright highlights, night shots), and how Instagram or other platforms
+    display the result. There is no objective colour-accuracy test.
+  * Dolby Vision dynamic metadata, if a file carries it, is ignored; only
+    the HLG/PQ signal ffprobe reports is used.
+  * With an FFmpeg whose scale filter lacks these options, HDR clips are
+    refused rather than mislabelled.
 * **Short audio is padded with silence** to each clip's length (so A/V stays
   in sync across clips); this is reported only when a clip has no audio at
   all. A truncated *video* track is caught by the per-stream duration check.

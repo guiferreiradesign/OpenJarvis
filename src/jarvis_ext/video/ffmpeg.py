@@ -37,6 +37,25 @@ THUMBNAIL_FILENAME = "thumbnail.jpg"
 
 OUTPUT_FORMAT_WHITELIST = "mov,mp4,m4a,3gp,3g2,mj2"
 
+# Every render is SDR Rec.709, limited ("TV") range, 8-bit 4:2:0.
+OUTPUT_COLOR = {
+    "range": "tv",
+    "primaries": "bt709",
+    "transfer": "bt709",
+    "space": "bt709",
+}
+# ffprobe ``color_transfer`` values that mean the source is HDR.
+HDR_TRANSFERS = frozenset({"smpte2084", "arib-std-b67"})
+_HDR_NAMES = {"smpte2084": "PQ", "arib-std-b67": "HLG"}
+
+# scale-filter options needed for real colour conversion (swscale colour
+# management, detected by option name rather than version) and for HDR->SDR
+# tone mapping.
+_COLOR_MANAGEMENT_TOKENS = frozenset(
+    {"out_range", "out_color_matrix", "out_primaries", "out_transfer"}
+)
+_TONE_MAPPING_TOKENS = frozenset({"intent", "perceptual", "arib-std-b67", "smpte2084"})
+
 _MAX_LOG_TAIL_BYTES = 8192
 _MAX_ERROR_CHARS = 300
 _TERMINATE_GRACE_SECONDS = 5.0
@@ -71,6 +90,18 @@ class FfmpegCapabilities:
     version: str = ""
     encoders: FrozenSet[str] = field(default_factory=frozenset)
     filters: FrozenSet[str] = field(default_factory=frozenset)
+    # Option names and enum values listed by ``ffmpeg -h filter=scale``.
+    scale_options: FrozenSet[str] = field(default_factory=frozenset)
+
+    @property
+    def color_management(self) -> bool:
+        """The scale filter can convert primaries and transfer, not just tag."""
+        return _COLOR_MANAGEMENT_TOKENS <= self.scale_options
+
+    @property
+    def tone_mapping(self) -> bool:
+        """The scale filter can tone-map HLG/PQ HDR to SDR (perceptual intent)."""
+        return self.color_management and _TONE_MAPPING_TOKENS <= self.scale_options
 
     def missing_for(self, plan: EditPlan) -> List[str]:
         """Names of encoders/filters *plan* needs that this build lacks."""
@@ -103,6 +134,16 @@ def _listing_names(text: str) -> FrozenSet[str]:
         if len(parts) >= 2 and re.fullmatch(r"[A-Z.|]{2,8}", parts[0]):
             names.add(parts[1])
     return frozenset(names)
+
+
+def _option_tokens(text: str) -> FrozenSet[str]:
+    """First word of each row of ``ffmpeg -h filter=...`` (options and values)."""
+    tokens = set()
+    for line in text.splitlines():
+        parts = line.split()
+        if parts:
+            tokens.add(parts[0].lstrip("-"))
+    return frozenset(tokens)
 
 
 def query_capabilities(
@@ -139,6 +180,7 @@ def query_capabilities(
         version=version,
         encoders=_listing_names(run("-encoders")),
         filters=_listing_names(run("-filters")),
+        scale_options=_option_tokens(run("-h", "filter=scale")),
     )
 
 
@@ -155,6 +197,39 @@ class ClipInput:
     start: float
     duration: float
     has_audio: bool
+    # ffprobe colour_transfer of the source (e.g. "arib-std-b67" for HLG).
+    color_transfer: Optional[str] = None
+
+    @property
+    def hdr(self) -> bool:
+        return self.color_transfer in HDR_TRANSFERS
+
+
+def hdr_name(transfer: Optional[str]) -> str:
+    return _HDR_NAMES.get(transfer or "", "HDR")
+
+
+def color_conversion(clip: ClipInput, capabilities: "FfmpegCapabilities") -> str:
+    """scale-filter options that convert *clip* to the output colour space.
+
+    Full-range ("JPEG", ``yuvj420p``) sources are converted to limited range
+    in every case.  With swscale colour management the primaries and
+    transfer are converted too, and HDR (HLG/PQ) sources are tone-mapped
+    with the perceptual intent.  The tool refuses HDR clips when tone
+    mapping is unavailable (see ``media_render``), so an HDR signal is never
+    merely relabelled as Rec.709.
+    """
+    options = (
+        f"out_range={OUTPUT_COLOR['range']}:out_color_matrix={OUTPUT_COLOR['space']}"
+    )
+    if capabilities.color_management:
+        options += (
+            f":out_primaries={OUTPUT_COLOR['primaries']}"
+            f":out_transfer={OUTPUT_COLOR['transfer']}"
+        )
+        if clip.hdr:
+            options += ":intent=perceptual"
+    return options
 
 
 @dataclass(frozen=True)
@@ -209,32 +284,39 @@ def _seconds(value: float) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _geometry(plan: EditPlan, color: str) -> str:
+    width, height = plan.width, plan.height
+    if plan.fit == "crop":
+        return (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase:{color},"
+            f"crop={width}:{height}"
+        )
+    return (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease:"
+        f"force_divisible_by=2:{color},"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
+    )
+
+
 def build_filter_graph(
     plan: EditPlan,
     clips: Sequence[ClipInput],
     logo: Optional[LogoInput] = None,
+    capabilities: Optional[FfmpegCapabilities] = None,
 ) -> tuple:
     """Return ``(filter_complex, video_label, audio_label_or_None)``.
 
     Inputs are numbered clips first, then the logo.  Only numbers and fixed
     keywords appear in the graph.
     """
-    width, height, fps = plan.width, plan.height, plan.frame_rate
-    if plan.fit == "crop":
-        geometry = (
-            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height}"
-        )
-    else:
-        geometry = (
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease:"
-            f"force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
-        )
+    capabilities = capabilities or FfmpegCapabilities()
+    fps = plan.frame_rate
     keep_audio = plan.audio_mode == "keep"
     parts: List[str] = []
     concat_inputs = ""
     for index, clip in enumerate(clips):
         duration = _seconds(clip.duration)
+        geometry = _geometry(plan, color_conversion(clip, capabilities))
         parts.append(
             f"[{index}:v:0]{geometry},setsar=1,fps={fps},"
             f"trim=duration={duration},setpts=PTS-STARTPTS,format=yuv420p[v{index}]"
@@ -301,6 +383,7 @@ def build_render_command(
     clips: Sequence[ClipInput],
     *,
     logo: Optional[LogoInput] = None,
+    capabilities: Optional[FfmpegCapabilities] = None,
 ) -> List[str]:
     """Complete argument list for one render, run with cwd = render dir."""
     if len(clips) != len(plan.clips):
@@ -334,7 +417,7 @@ def build_render_command(
             f"file:{SUBTITLE_FILENAME}",
         ]
 
-    graph, video, audio = build_filter_graph(plan, clips, logo)
+    graph, video, audio = build_filter_graph(plan, clips, logo, capabilities)
     cmd += ["-filter_complex", graph, "-map", f"[{video}]"]
     if audio:
         cmd += ["-map", f"[{audio}]"]
@@ -350,6 +433,11 @@ def build_render_command(
         "-pix_fmt", "yuv420p",
         "-r", str(fps),
         "-g", str(fps * 2),
+        # Accurate because every clip was converted in its scale step.
+        "-color_range", OUTPUT_COLOR["range"],
+        "-color_primaries", OUTPUT_COLOR["primaries"],
+        "-color_trc", OUTPUT_COLOR["transfer"],
+        "-colorspace", OUTPUT_COLOR["space"],
     ]  # fmt: skip
     if audio:
         cmd += [
@@ -514,6 +602,8 @@ def log_tail(log_path: Path, *, redact: Mapping[str, str]) -> str:
 
 
 __all__ = [
+    "HDR_TRANSFERS",
+    "OUTPUT_COLOR",
     "ClipInput",
     "FfmpegCapabilities",
     "FfmpegError",
@@ -529,6 +619,8 @@ __all__ = [
     "build_preview_command",
     "build_render_command",
     "build_thumbnail_command",
+    "color_conversion",
+    "hdr_name",
     "log_tail",
     "logo_geometry",
     "minimal_env",

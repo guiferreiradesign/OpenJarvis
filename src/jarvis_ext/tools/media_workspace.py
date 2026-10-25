@@ -382,6 +382,10 @@ def parse_ffprobe_output(payload: Any) -> Dict[str, Any]:
             "pixel_format": _safe_text(video.get("pix_fmt")),
             "rotation": _rotation(video),
             "duration_seconds": _stream_duration(video),
+            "color_range": _safe_text(video.get("color_range")),
+            "color_space": _safe_text(video.get("color_space")),
+            "color_transfer": _safe_text(video.get("color_transfer")),
+            "color_primaries": _safe_text(video.get("color_primaries")),
         }
         if width and height:
             if info["rotation"] in (90, 270):

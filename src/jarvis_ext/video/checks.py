@@ -29,6 +29,10 @@ class Expectations:
     audio_codec: str = "aac"
     pixel_format: str = "yuv420p"
     audio_sample_rate: int = 48000
+    color_range: str = "tv"
+    color_primaries: str = "bt709"
+    color_transfer: str = "bt709"
+    color_space: str = "bt709"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -146,6 +150,30 @@ def check_media(
                 video.get("codec") == expected.video_codec,
                 expected.video_codec,
                 video.get("codec"),
+            )
+        )
+        checks.append(
+            make_check(
+                "color_range",
+                video.get("color_range") == expected.color_range,
+                expected.color_range,
+                video.get("color_range"),
+            )
+        )
+        expected_tags = {
+            "primaries": expected.color_primaries,
+            "transfer": expected.color_transfer,
+            "space": expected.color_space,
+        }
+        actual_tags = {
+            key: video.get(f"color_{key}") for key in ("primaries", "transfer", "space")
+        }
+        checks.append(
+            make_check(
+                "color_metadata",
+                actual_tags == expected_tags,
+                expected_tags,
+                actual_tags,
             )
         )
         checks.append(

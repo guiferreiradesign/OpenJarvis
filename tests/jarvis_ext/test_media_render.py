@@ -27,6 +27,7 @@ from openjarvis.tools._stubs import ToolExecutor
 from .video_fakes import (
     FILTERS,
     HAVE_FFMPEG,
+    OLD_SCALE_HELP,
     FakeProcess,
     FakeRunner,
     digest_tree,
@@ -374,12 +375,49 @@ class TestRenderMocked:
         assert report["render_status"] == "invalid_media"
         assert "no video" in report["error"]
 
-    def test_hdr_source_warns(self, dirs):
+    def test_hlg_source_is_tone_mapped(self, dirs):
         runner = _runner()
-        runner.payloads["a.mp4"] = probe_payload(duration=10, pix_fmt="yuv420p10le")
+        runner.payloads["a.mp4"] = probe_payload(
+            duration=10,
+            pix_fmt="yuv420p10le",
+            color_transfer="arib-std-b67",
+            color_primaries="bt2020",
+            color_space="bt2020nc",
+        )
+        process = FakeProcess()
+        result, report = _render(dirs, runner=runner, process=process)
+        assert result.success, report
+        assert any("HLG HDR source tone-mapped" in w for w in report["warnings"])
+        graph = process.calls[0]["cmd"][
+            process.calls[0]["cmd"].index("-filter_complex") + 1
+        ]
+        scales = [p.split(",")[0] for p in graph.split(";") if ":v:0]scale=" in p]
+        assert ["intent=perceptual" in s for s in scales] == [True, False]
+
+    def test_hdr_refused_without_tone_mapping(self, dirs):
+        """Never relabel an HDR signal as Rec.709 without converting it."""
+        runner = _runner()
+        runner.scale_help = OLD_SCALE_HELP
+        runner.payloads["a.mp4"] = probe_payload(
+            duration=10, color_transfer="arib-std-b67", color_primaries="bt2020"
+        )
         result, report = _render(dirs, runner=runner)
-        assert result.success
-        assert any("tone mapping" in w for w in report["warnings"])
+        assert not result.success
+        assert report["render_status"] == "unsupported"
+        assert "HLG HDR" in report["error"] and "tone-map" in report["error"]
+        assert not list(dirs[1].glob("*.mp4"))
+
+    def test_sdr_sources_render_with_old_ffmpeg(self, dirs):
+        runner = _runner()
+        runner.scale_help = OLD_SCALE_HELP
+        result, report = _render(dirs, runner=runner)
+        assert result.success, report
+
+    def test_full_range_output_is_not_published(self, dirs):
+        result, report = _render(dirs, runner=_runner(color_range="pc"))
+        assert report["render_status"] == "failed_checks"
+        assert "color_range" in report["error"]
+        assert not list(dirs[1].glob("*.mp4"))
 
     # -- configuration and folders ------------------------------------------
 
@@ -923,6 +961,119 @@ class TestRealFfmpeg:
         assert not result.success and report["ready_for_review"] is False
         assert failed == ["decodes_cleanly"], report["checks"]
         assert report["preview"] is None
+
+    def _signal_stats(self, path: Path, at: float) -> Dict[str, float]:
+        out = subprocess.run(
+            ["ffmpeg", "-v", "error", "-ss", str(at), "-i", str(path),
+             "-frames:v", "1", "-vf", "signalstats,metadata=print:file=-",
+             "-f", "null", "-"],
+            capture_output=True, text=True, check=True,
+        ).stdout  # fmt: skip
+        stats = {}
+        for key in ("YMIN", "YMAX", "YAVG"):
+            stats[key] = float(out.split(f"lavfi.signalstats.{key}=")[1].split()[0])
+        return stats
+
+    @pytest.mark.parametrize("fit", ["crop", "pad"])
+    def test_full_range_source_becomes_limited_range(self, real, fit):
+        """Regression for real iPhone footage: yuvj420p in, yuv420p/tv out,
+        with pixel values actually rescaled (black 0->16, white 255->235)."""
+        workspace, output, _ = real
+        for name, colour in (("black", "black"), ("white", "white")):
+            run_ffmpeg(
+                "-f", "lavfi", "-i", f"color=c={colour}:size=640x360:rate=30",
+                "-t", "1", "-c:v", "libx264", "-preset", "ultrafast",
+                "-pix_fmt", "yuvj420p", "-color_range", "pc",
+                str(workspace / "Shoot" / f"full_{name}.mp4"),
+            )  # fmt: skip
+            assert (
+                self._probe(workspace / "Shoot" / f"full_{name}.mp4")["streams"][0][
+                    "color_range"
+                ]
+                == "pc"
+            )
+        render, validate = self._tools(real)
+        plan = {
+            "output_name": f"range_{fit}",
+            "fit": fit,
+            "audio": {"mode": "none"},
+            "video": {"x264_preset": "ultrafast"},
+            "clips": [
+                {"source": "Shoot/full_black.mp4", "start": 0, "end": 1},
+                {"source": "Shoot/full_white.mp4", "start": 0, "end": 1},
+            ],
+        }
+        result = render.execute(plan=plan)
+        assert result.success, result.content
+        target = output / f"range_{fit}_v001.mp4"
+        stream = self._probe(target)["streams"][0]
+        assert stream["pix_fmt"] == "yuv420p"
+        assert stream["color_range"] == "tv"
+        assert stream["color_primaries"] == "bt709"
+        assert stream["color_transfer"] == "bt709"
+        assert stream["color_space"] == "bt709"
+        black = self._signal_stats(target, 0.5)
+        white = self._signal_stats(target, 1.5)
+        assert black["YAVG"] == pytest.approx(16, abs=2)
+        if fit == "crop":  # pad adds black bars to the white frame
+            assert white["YAVG"] == pytest.approx(235, abs=2)
+        assert white["YMAX"] <= 236
+        checked = json.loads(validate.execute(output=target.name).content)
+        assert checked["ready_for_review"] is True, checked["checks"]
+
+    def test_hlg_source_is_tone_mapped_not_relabelled(self, real, tmp_path):
+        """An HLG/BT.2020 10-bit clip renders as genuinely converted Rec.709."""
+        workspace, output, _ = real
+        source = workspace / "Shoot" / "landscape.mp4"
+        hlg = workspace / "Shoot" / "hlg.mkv"
+        run_ffmpeg(
+            "-i", str(source), "-t", "1", "-an",
+            # setparams tags the frames; FFmpeg 9 lets frame properties
+            # override -color_trc/-color_primaries output options.
+            "-vf", "scale=out_color_matrix=bt2020:out_range=tv,"
+            "format=yuv420p10le,setparams=color_primaries=bt2020:"
+            "color_trc=arib-std-b67:colorspace=bt2020nc:range=tv",
+            "-c:v", "ffv1",
+            str(hlg),
+        )  # fmt: skip
+        stream = self._probe(hlg)["streams"][0]
+        assert stream["color_transfer"] == "arib-std-b67"
+        render, validate = self._tools(real)
+        caps = render._ffmpeg_capabilities(shutil.which("ffmpeg"))
+        if not caps.tone_mapping:
+            pytest.skip("this FFmpeg cannot tone-map; refusal is tested with mocks")
+        result = render.execute(
+            plan={
+                "output_name": "hlg",
+                "audio": {"mode": "none"},
+                "video": {"x264_preset": "ultrafast"},
+                "clips": [{"source": "Shoot/hlg.mkv", "start": 0, "end": 1}],
+            }
+        )
+        report = json.loads(result.content)
+        assert result.success, report
+        assert any("HLG HDR source tone-mapped" in w for w in report["warnings"])
+        stream = self._probe(output / "hlg_v001.mp4")["streams"][0]
+        assert (stream["color_transfer"], stream["color_primaries"]) == (
+            "bt709",
+            "bt709",
+        )
+        # Same frame rendered as plain SDR: tone mapping must change pixels.
+        sdr = json.loads(
+            render.execute(
+                plan={
+                    "output_name": "sdr",
+                    "audio": {"mode": "none"},
+                    "video": {"x264_preset": "ultrafast"},
+                    "clips": [{"source": "Shoot/landscape.mp4", "start": 0, "end": 1}],
+                }
+            ).content
+        )
+        assert sdr["render_status"] == "succeeded"
+        hdr_stats = self._signal_stats(output / "hlg_v001.mp4", 0.5)
+        sdr_stats = self._signal_stats(output / "sdr_v001.mp4", 0.5)
+        assert abs(hdr_stats["YAVG"] - sdr_stats["YAVG"]) > 3
+        assert validate.execute(output="hlg_v001.mp4").success
 
     @pytest.mark.parametrize("faststart", [False, True])
     def test_truncated_source_is_never_published(self, real, tmp_path, faststart):

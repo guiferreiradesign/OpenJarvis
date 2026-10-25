@@ -53,7 +53,8 @@ Changed from the original plan:
 
 Done in this session (macOS 26.5.1 arm64, Python 3.13.17, FFmpeg 9.0.2):
 
-* `uv run pytest tests/jarvis_ext`: 372 passed, 0 skipped.
+* `uv run pytest tests/jarvis_ext`: 388 passed, 0 skipped (after the
+  colour fix below; 372 before it).
 * Wider suite (`uv run pytest tests/ -n auto -m "not live and not cloud and
   not hub"`, dev extras only): 9225 passed, 270 skipped, 9 failed, 5
   collection errors. The same 9 failures and 5 errors occur on the
@@ -69,19 +70,35 @@ Done in this session (macOS 26.5.1 arm64, Python 3.13.17, FFmpeg 9.0.2):
   (crop, logo position) and the subtitle track was extracted and checked
   for sanitised text.
 
-Still for you to do (needs real footage, which tests must not use):
+First real-footage test (2026-10-25), with a temporary config pointing at
+`~/Movies/JARVIS-Test-Media` (sources) and `~/Movies/JARVIS-Test-Renders`
+(output):
 
-1. Create the output folder and config (see video-pipeline.md), copy two
-   or three clips (one iPhone portrait clip) into a test workspace, and
-   write a small plan with `media-inspect` durations.
-2. `uv run python -m jarvis_ext media-render plan.json --validate`, then
-   open the preview, thumbnail and full file in QuickTime. Check framing,
-   cuts at the requested times, audio sync across clips, and the logo.
-3. Check how the iPhone HDR (Dolby Vision, 10-bit) clip looks: no tone
-   mapping is applied (see video-pipeline.md, limitations).
-4. Upload one render to Instagram as a private/draft Reel to confirm the
+* Sources: `IMG_1301.mov` (1920×1080, 30.03 fps, HEVC 8-bit full range),
+  `vid.mov` (1920×1080, 60 fps, HEVC 8-bit full range), `demo-video.MOV`
+  (1080×1920, 59.89 fps, HEVC 10-bit HLG/BT.2020).
+* Plan: 5 s + 6 s + 4 s, crop, audio kept → 15 s `instagram_reel`.
+* First attempt: **rejected before publishing** (output was `yuvj420p`, full
+  range). Root cause and fix in DECISIONS.md D18. Nothing was published.
+* After the fix: `phase2_test_reel_v001.mp4` rendered and validated. All
+  18 checks passed, including 1080×1920, 30 fps, 15.0 s per stream, H.264
+  High yuv420p, tv range, Rec.709 tags, AAC 48 kHz stereo, and full decode.
+  The preview (360×640) and thumbnail were created. The HLG clip was
+  tone-mapped (warning shown) and looked natural on inspection (a visual
+  check of single frames, not a colour measurement). Source SHA-256, sizes
+  and mtimes were unchanged.
+* Not covered by this test: PQ HDR, HDR from other devices, pad framing,
+  logo and subtitles on real footage, and playback on Instagram.
+
+Still for you to do:
+
+1. Watch `phase2_test_reel_v001.mp4` in QuickTime. Check framing, cuts at
+   the requested times, audio sync across clips, and the HDR segment's
+   colours.
+2. Upload one render to Instagram as a private/draft Reel to confirm the
    format is accepted (manual; JARVIS does not post anything).
-5. Decide whether you want burned-in captions (needs an FFmpeg with
+3. Try `fit: "pad"`, a logo and an `.srt` file on real footage.
+4. Decide whether you want burned-in captions (needs an FFmpeg with
    libass) and/or local Whisper (`uv sync --extra speech` plus a one-off
    model download of about 75–145 MB).
 

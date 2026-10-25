@@ -151,6 +151,25 @@ an extension point until a local Whisper model is approved.
 `-map_metadata -1 -map_chapters -1` on every output. iPhone clips carry GPS
 location and device data, and renders are meant to be shared.
 
+## D18. Convert colour in each clip's scale step; tone-map HDR or refuse it
+
+**Decision:** every clip's `scale` converts to limited-range Rec.709
+(`out_range=tv:out_color_matrix=bt709`, plus `out_primaries`/`out_transfer`
+when swscale has colour management). HLG/PQ clips also get
+`intent=perceptual`. Outputs are tagged Rec.709/tv, and validation checks
+the range and tags. If FFmpeg cannot tone-map, HDR clips are refused.
+
+**Why:** the first real-footage render failed its pre-publish check. Two
+full-range (`yuvj420p`) iPhone clips made the output full range, because
+`format=yuv420p` changes the pixel layout, not the range. Tagging alone
+would be wrong: an HLG signal labelled Rec.709 shows flat, grey colours.
+A test on the real HLG clip showed swscale's perceptual intent gives
+natural skin tones where the clipping intent blows out highlights, and that
+`-intent` on the command line is silently ignored for `-filter_complex`,
+so the option is set inline. Regression tests check the generated command
+and real pixel values (full-range black/white become 16/235). HLG was
+verified on one real clip by eye; PQ only through the generated command.
+
 ## Assumptions
 
 * Only you (and processes you trust) write to the media workspace. See the

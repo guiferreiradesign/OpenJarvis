@@ -113,7 +113,9 @@ result = MediaWorkspaceInspectTool().execute(subpath="Skyline", media_type="vide
 ```
 
 Since Phase 2 the `video` and `audio` objects also carry their own
-`duration_seconds` (a stream can be shorter than the container).
+`duration_seconds` (a stream can be shorter than the container), and
+`video` reports `color_range`, `color_space`, `color_transfer` and
+`color_primaries` (for example `arib-std-b67`/`bt2020` for iPhone HLG HDR).
 `metadata.status` is one of `ok`, `invalid_media`, `timeout`, `probe_failed`,
 `unreadable`, `skipped` (the file changed during inspection) or
 `skipped_time_budget`. `orientation` takes the rotation flag that phones write

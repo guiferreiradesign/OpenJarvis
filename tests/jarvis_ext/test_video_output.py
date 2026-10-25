@@ -37,7 +37,10 @@ from jarvis_ext.video.output import (
 )
 from jarvis_ext.video.plan import parse_edit_plan
 
-from .video_fakes import FakeRunner
+from .video_fakes import OLD_SCALE_HELP, FakeRunner
+
+CAPS = query_capabilities("ffmpeg", FakeRunner())
+OLD_CAPS = query_capabilities("ffmpeg", FakeRunner(scale_help=OLD_SCALE_HELP))
 
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX filesystem")
 
@@ -300,11 +303,58 @@ class TestCommandConstruction:
     def test_filter_graph_crop_and_pad(self, tmp_path):
         clips = _clips(tmp_path, ["a", "b"])
         graph, video, audio = build_filter_graph(_plan(), clips)
-        assert "force_original_aspect_ratio=increase,crop=1080:1920" in graph
+        assert "force_original_aspect_ratio=increase:" in graph
+        assert ",crop=1080:1920," in graph
         assert "concat=n=2:v=1:a=1" in graph
         assert (video, audio) == ("vcat", "acat")
         graph, _, _ = build_filter_graph(_plan(fit="pad"), clips)
         assert "pad=1080:1920" in graph and "crop=" not in graph
+
+    @pytest.mark.parametrize("fit", ["crop", "pad"])
+    @pytest.mark.parametrize("managed", [True, False])
+    def test_every_clip_is_converted_to_limited_range(self, tmp_path, fit, managed):
+        """Regression: full-range (yuvj420p) iPhone clips produced a
+        full-range output because only the pixel layout was converted."""
+        caps = CAPS if managed else OLD_CAPS
+        clips = _clips(tmp_path, ["a", "b"])
+        graph, _, _ = build_filter_graph(_plan(fit=fit), clips, capabilities=caps)
+        chains = [part for part in graph.split(";") if ":v:0]scale=" in part]
+        assert len(chains) == 2
+        for chain in chains:
+            scale = chain.split(",")[0]
+            assert "out_range=tv" in scale and "out_color_matrix=bt709" in scale
+            assert ("out_primaries=bt709" in scale) is managed
+            assert ("out_transfer=bt709" in scale) is managed
+            assert "intent=" not in scale
+            assert chain.endswith("format=yuv420p[v0]") or chain.endswith(
+                "format=yuv420p[v1]"
+            )
+
+    def test_only_hdr_clips_are_tone_mapped(self, tmp_path):
+        clips = [
+            ClipInput(tmp_path / "sdr", 0, 2.0, True, color_transfer="bt709"),
+            ClipInput(tmp_path / "hlg", 0, 2.0, True, color_transfer="arib-std-b67"),
+            ClipInput(tmp_path / "pq", 0, 2.0, True, color_transfer="smpte2084"),
+        ]
+        plan = parse_edit_plan(
+            {
+                "output_name": "reel",
+                "clips": [{"source": "a.mp4", "start": 0, "end": 2}] * 3,
+            }
+        )
+        graph, _, _ = build_filter_graph(plan, clips, capabilities=CAPS)
+        scales = [p.split(",")[0] for p in graph.split(";") if ":v:0]scale=" in p]
+        assert ["intent=perceptual" in s for s in scales] == [False, True, True]
+        assert all("out_transfer=bt709" in s for s in scales)
+
+    def test_output_is_tagged_rec709_limited(self, tmp_path):
+        cmd = build_render_command("ffmpeg", _plan(), _clips(tmp_path, ["a", "b"]))
+        tags = {cmd[i]: cmd[i + 1] for i in range(len(cmd) - 1)}
+        assert tags["-color_range"] == "tv"
+        assert tags["-color_primaries"] == "bt709"
+        assert tags["-color_trc"] == "bt709"
+        assert tags["-colorspace"] == "bt709"
+        assert tags["-pix_fmt"] == "yuv420p"
 
     def test_silent_clip_gets_generated_silence(self, tmp_path):
         clips = [ClipInput(tmp_path / "a", 0, 2.0, has_audio=False)]
@@ -401,6 +451,13 @@ class TestCapabilities:
         assert {"libx264", "aac", "mov_text"} <= caps.encoders
         assert {"overlay", "scale", "concat"} <= caps.filters
         assert "subtitles" not in caps.filters
+
+    def test_scale_colour_management(self):
+        caps = query_capabilities("ffmpeg", FakeRunner())
+        assert caps.color_management and caps.tone_mapping
+        old = query_capabilities("ffmpeg", FakeRunner(scale_help=OLD_SCALE_HELP))
+        assert not old.color_management and not old.tone_mapping
+        assert not FfmpegCapabilities().tone_mapping
 
     def test_missing_features(self):
         caps = query_capabilities("ffmpeg", FakeRunner())

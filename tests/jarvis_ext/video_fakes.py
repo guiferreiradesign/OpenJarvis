@@ -47,6 +47,28 @@ FILTERS = b"""Filters:
  T.. trim              V->V       Pick one continuous section from the input.
 """
 
+# Abridged ``ffmpeg -h filter=scale`` from FFmpeg 9 (swscale colour management).
+SCALE_HELP = b"""Filter scale
+scale AVOptions:
+   out_color_matrix  <int>        ..FV....... set output YCbCr type
+     bt709           1            ..FV.......
+   out_range         <int>        ..FV....... set output color range
+     tv              1            ..FV.......
+   out_primaries     <int>        ..FV....... set output primaries
+     bt709           1            ..FV.......
+   out_transfer      <int>        ..FV....... set output color transfer
+     smpte2084       16           ..FV.......
+     arib-std-b67    18           ..FV.......
+SWScaler AVOptions:
+  -intent            <int>        E..V....... color mapping intent
+     perceptual      0            E..V....... perceptual tone mapping
+"""
+# An older FFmpeg: range/matrix conversion only.
+OLD_SCALE_HELP = b"""Filter scale
+   out_color_matrix  <int>        ..FV....... set output YCbCr type
+   out_range         <int>        ..FV....... set output color range
+"""
+
 
 def probe_payload(
     *,
@@ -60,6 +82,10 @@ def probe_payload(
     pix_fmt: str = "yuv420p",
     container: str = "mov,mp4,m4a,3gp,3g2,mj2",
     video_duration: Optional[float] = None,
+    color_range: Optional[str] = "tv",
+    color_transfer: Optional[str] = "bt709",
+    color_primaries: Optional[str] = "bt709",
+    color_space: Optional[str] = "bt709",
 ) -> Dict[str, Any]:
     streams: List[Dict[str, Any]] = [
         {
@@ -72,6 +98,13 @@ def probe_payload(
             "duration": str(video_duration if video_duration is not None else duration),
         }
     ]
+    colors = {
+        "color_range": color_range,
+        "color_transfer": color_transfer,
+        "color_primaries": color_primaries,
+        "color_space": color_space,
+    }
+    streams[0].update({key: value for key, value in colors.items() if value})
     if audio:
         streams.append(
             {
@@ -101,10 +134,12 @@ class FakeRunner:
         *,
         encoders: bytes = ENCODERS,
         filters: bytes = FILTERS,
+        scale_help: bytes = SCALE_HELP,
     ) -> None:
         self.payloads = dict(payloads or {})
         self.encoders = encoders
         self.filters = filters
+        self.scale_help = scale_help
         self.calls: List[Dict[str, Any]] = []
 
     def __call__(self, cmd, **kwargs):
@@ -117,6 +152,8 @@ class FakeRunner:
             out = self.encoders
         elif "-filters" in cmd:
             out = self.filters
+        elif "-h" in cmd:
+            out = self.scale_help
         else:
             name = Path(cmd[-1].removeprefix("file:")).name
             if name not in self.payloads:
@@ -261,6 +298,8 @@ __all__ = [
     "FakeProcess",
     "FakeRunner",
     "HAVE_FFMPEG",
+    "OLD_SCALE_HELP",
+    "SCALE_HELP",
     "digest_tree",
     "ffmpeg",
     "make_render_tool",
