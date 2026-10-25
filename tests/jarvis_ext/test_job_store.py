@@ -449,6 +449,51 @@ class TestRunningJobs:
         notes = [e.note for e in store.events(job.id)]
         assert notes[-2:] == ["cancellation requested", "cancelled by worker"]
 
+    def test_fail_keeps_partial_result(self, store):
+        job = _running(store)
+        failed = store.fail(job.id, WORKER, "validate_failed", "bad", {"output": "a"})
+        assert failed.result == {"output": "a"}
+
+    def test_confirm_cancelled_keeps_result(self, store):
+        job = _running(store)
+        store.cancel(job.id)
+        done = store.confirm_cancelled(job.id, WORKER, {"stage": "after_render"})
+        assert done.result == {"stage": "after_render"}
+
+    def test_invalid_cancel_result_leaves_job_running(self, store):
+        job = _running(store)
+        store.cancel(job.id)
+        with pytest.raises(InvalidJobError):
+            store.confirm_cancelled(job.id, WORKER, {"x": float("nan")})
+        assert store.get(job.id).status is JobStatus.RUNNING
+
+    def test_add_note(self, store):
+        job = _running(store)
+        store.add_note(job.id, WORKER, "rendered reel_v001.mp4")
+        store.add_note(job.id, WORKER, "n" * 1000)
+        events = store.events(job.id)
+        assert events[-2].note == "rendered reel_v001.mp4"
+        assert events[-2].from_status is events[-2].to_status is JobStatus.RUNNING
+        assert len(events[-1].note) == 500
+        assert store.get(job.id).status is JobStatus.RUNNING
+
+    @pytest.mark.parametrize("note", ["", "   ", None, 3])
+    def test_add_note_rejects_empty(self, store, note):
+        job = _running(store)
+        with pytest.raises(InvalidJobError):
+            store.add_note(job.id, WORKER, note)
+
+    def test_add_note_only_while_running_and_owned(self, store):
+        queued = store.submit(KIND, {})
+        with pytest.raises(InvalidTransitionError):
+            store.add_note(queued.id, WORKER, "x")
+        job = store.claim_next(WORKER)
+        with pytest.raises(InvalidTransitionError):
+            store.add_note(job.id, "other", "x")
+        store.complete(job.id, WORKER)
+        with pytest.raises(InvalidTransitionError):
+            store.add_note(job.id, WORKER, "x")
+
     def test_confirm_cancelled_needs_a_request(self, store):
         job = _running(store)
         with pytest.raises(InvalidTransitionError):

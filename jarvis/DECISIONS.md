@@ -287,6 +287,45 @@ Recovery needs a heartbeat, which arrives with the worker.
 untrustworthy. Implemented in step 1 (store rules, tested); the worker
 side is step 3.
 
+## D28. Single-job runner: generic outcome mapping, video handler on the existing tools
+
+**Decision:**
+
+* `jarvis_ext/jobs/runner.py` is skill-neutral. `run_next` claims one job
+  of a kind it has a handler for, calls the handler, and maps its
+  `JobOutcome` (`succeeded`, `failed`, `retry`, `cancelled`) onto the
+  store's permitted transitions. An exception, a non-outcome return value,
+  an unstorable result or an unrequested "cancelled" becomes a failure,
+  never a success. `KeyboardInterrupt`/`SystemExit` are not caught, so an
+  interrupted job stays `running` for the Step 3 worker to recover.
+* `jarvis_ext/video/render_job.py` handles `video.render` with payload
+  `{"plan": EditPlan}`. It calls the existing `media_render` and
+  `media_validate` tools and adds no rendering or checking of its own.
+  The plan is validated by `media_render` before anything is written.
+* Success requires a successful render **and** a passed validation with
+  `ready_for_review: true`, preview and thumbnail, for the same file.
+* Retryable render statuses: `workspace_unavailable`,
+  `output_unavailable`, `ffmpeg_failed`, `output_error`. Every other
+  render status (including `timeout`, `failed_checks` and unknown
+  statuses) is permanent. **Validation failures are never retried**: a
+  retry would render a second version of a file that already exists. The
+  job fails and its result names the unvalidated file.
+* Error codes are `render_<status>` or `validate_<status>`; the job result
+  keeps a compact summary of both stages (file, size, SHA-256, record,
+  preview, thumbnail, failed check names, trimmed warnings).
+* Cancellation is checked before rendering and between render and
+  validation. A handler (or the Step 3 process control) can raise
+  `JobCancelled` once the work has stopped. A render published before a
+  cancellation took effect is recorded as "published but not validated".
+
+**Store additions (backward-compatible):** `fail` and
+`confirm_cancelled` accept an optional `result`, and `add_note` appends a
+stage note (for example `rendered reel_v001.mp4`) to a running job's
+history. No schema change.
+
+**Not changed (D24):** the Phase 2 tools, render record and FFmpeg
+handling are untouched.
+
 ## Assumptions
 
 * Only you (and processes you trust) write to the media workspace. See the

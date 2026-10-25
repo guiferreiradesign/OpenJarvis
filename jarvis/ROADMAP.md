@@ -107,12 +107,12 @@ Still for you to do:
 Goal: renders (and later other long-running skills) run as **jobs** that
 are tracked from submission to a final status, can be cancelled and
 retried safely, notify you, and support revisions. Approved decisions:
-D19–D24 and D27 in DECISIONS.md; design notes D25–D26. Details: [jobs.md](jobs.md).
+D19–D24 and D27 in DECISIONS.md; design notes D25–D26 and D28. Details: [jobs.md](jobs.md).
 
 | Step | Scope | Status |
 |---|---|---|
 | 1 | Job store and status rules: SQLite (WAL), schema version, generic job model, allowed transitions, atomic claiming, `[jarvis.jobs]` config | **Done** |
-| 2 | Single-job runner for `video.render`: calls `media_render` then `media_validate`, classifies failures, retries only temporary ones | Planned |
+| 2 | Single-job runner for `video.render`: calls `media_render` then `media_validate`, classifies failures, retries only temporary ones | **Done** |
 | 3 | Worker and CLI: submit, list, show, cancel; single-worker lock; crash recovery (heartbeat); leftover temp-folder cleanup | Planned |
 | 4 | Progress from FFmpeg `-progress`, in job status and on the event bus | Planned |
 | 5 | Notifications on final status: log + macOS | Planned |

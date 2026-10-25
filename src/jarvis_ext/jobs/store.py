@@ -53,6 +53,8 @@ from jarvis_ext.jobs.settings import JobSettings
 
 logger = logging.getLogger(__name__)
 
+MAX_NOTE_CHARS = 500
+
 SCHEMA_VERSION = 1
 # "JRVJ" — marks the file as a JARVIS job database (PRAGMA application_id).
 APPLICATION_ID = 0x4A52564A
@@ -316,29 +318,33 @@ class JobStore:
         self, job_id: str, worker_id: str, result: Optional[dict] = None
     ) -> Job:
         """``running`` → ``succeeded``, storing the runner's result."""
-        result_text = (
-            None
-            if result is None
-            else encode_json_object(result, "result", MAX_RESULT_BYTES)
-        )
         return self._finish_running(
             job_id,
             worker_id,
             JobStatus.SUCCEEDED,
-            {"result": result_text},
+            {"result": _encode_result(result)},
             "succeeded",
         )
 
     def fail(
-        self, job_id: str, worker_id: str, error_code: str, error_message: str = ""
+        self,
+        job_id: str,
+        worker_id: str,
+        error_code: str,
+        error_message: str = "",
+        result: Optional[dict] = None,
     ) -> Job:
-        """``running`` → ``failed`` (final)."""
+        """``running`` → ``failed`` (final), optionally keeping partial results."""
         code = validate_error_code(error_code)
         return self._finish_running(
             job_id,
             worker_id,
             JobStatus.FAILED,
-            {"error_code": code, "error_message": clean_error_message(error_message)},
+            {
+                "error_code": code,
+                "error_message": clean_error_message(error_message),
+                "result": _encode_result(result),
+            },
             code,
         )
 
@@ -377,8 +383,15 @@ class JobStore:
                 f"retry after {code}",
             )
 
-    def confirm_cancelled(self, job_id: str, worker_id: str) -> Job:
-        """``running`` → ``cancelled`` once the worker has stopped the work."""
+    def confirm_cancelled(
+        self, job_id: str, worker_id: str, result: Optional[dict] = None
+    ) -> Job:
+        """``running`` → ``cancelled`` once the worker has stopped the work.
+
+        *result* records what had already happened (for example a render that
+        was published but not validated), so the history stays truthful.
+        """
+        result_text = _encode_result(result)
         with self._write() as conn:
             job = self._get(conn, job_id)
             self._check_owner(job, worker_id, JobStatus.CANCELLED)
@@ -388,9 +401,28 @@ class JobStore:
                 conn,
                 job,
                 JobStatus.CANCELLED,
-                {"finished_at": self._clock()},
+                {"finished_at": self._clock(), "result": result_text},
                 "cancelled by worker",
             )
+
+    def add_note(self, job_id: str, worker_id: str, note: str) -> None:
+        """Append a progress note (e.g. a finished stage) to a running job.
+
+        Only the claiming worker may add notes; the status does not change.
+        """
+        if not isinstance(note, str) or not note.strip():
+            raise InvalidJobError("Note must be a non-empty string")
+        note = note[:MAX_NOTE_CHARS]
+        with self._write() as conn:
+            job = self._get(conn, job_id)
+            validate_worker_id(worker_id)
+            if job.status is not JobStatus.RUNNING or job.claimed_by != worker_id:
+                raise InvalidTransitionError(
+                    "Notes can only be added to a job this worker is running"
+                )
+            now = self._clock()
+            conn.execute("UPDATE jobs SET updated_at = ? WHERE id = ?", (now, job_id))
+            self._event(conn, job_id, job.status, job.status, note, now)
 
     # -- user operations -----------------------------------------------------
 
@@ -624,6 +656,12 @@ def _wrap(exc: sqlite3.Error) -> JobStoreError:
     if isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower():
         return JobStoreError("The job database is busy; try again")
     return JobStoreError(f"Job database error ({type(exc).__name__})")
+
+
+def _encode_result(result: Optional[dict]) -> Optional[str]:
+    if result is None:
+        return None
+    return encode_json_object(result, "result", MAX_RESULT_BYTES)
 
 
 def _row_to_job(row: sqlite3.Row) -> Job:
