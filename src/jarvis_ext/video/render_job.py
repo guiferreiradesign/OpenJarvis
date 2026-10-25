@@ -22,14 +22,21 @@ Outcomes (DECISIONS.md D23, D27, D28):
   after rendering but before validation.  A render published before the
   cancellation is listed in the result as *not validated*; it is never
   reported as a finished, validated output.
+
+Progress (D30): stage ``render`` goes from 0 to :data:`RENDER_SHARE` (95 %)
+following FFmpeg's encoded time against the plan's total duration; stage
+``validate`` holds at 95 % (validation reports no measurable progress); the
+store records 100 % only when the job succeeds.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import stat
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -44,14 +51,28 @@ from jarvis_ext.jobs.runner import (
     WorkerInterrupted,
     current_stop_reason,
 )
-from jarvis_ext.video.ffmpeg import ProcessStopped, run_process_until
+from jarvis_ext.video.ffmpeg import (
+    PROGRESS_FILENAME,
+    ProcessStopped,
+    ProgressReader,
+    run_process_until,
+)
 from jarvis_ext.video.output import TMP_DIRNAME, OutputFolder
+from jarvis_ext.video.plan import PlanError, parse_timestamp
 from openjarvis.core.types import ToolResult
 
 KIND = "video.render"
+RENDER_SHARE = 95.0
+STAGE_RENDER = "render"
+STAGE_VALIDATE = "validate"
 RENDER_STARTED_NOTE = "render started"
 RENDERED_NOTE_PREFIX = "rendered "
 _TEMP_PREFIX = "job-"  # OutputFolder.make_temp_dir's mkdtemp prefix
+
+logger = logging.getLogger(__name__)
+# The running render's progress callback (set by the handler, read by
+# stoppable_run_process in the same thread).
+_render_progress = threading.local()
 
 # Render statuses worth one more attempt: a folder that was briefly
 # unavailable (drive unplugged, network volume), FFmpeg exiting with an
@@ -102,7 +123,9 @@ class VideoRenderHandler:
             # Same tools as the CLI and agents use, with FFmpeg run through
             # stoppable_run_process so cancellation and shutdown can stop it.
             render_tool = render_tool or MediaRenderTool(
-                config_path=config_path, process_runner=stoppable_run_process
+                config_path=config_path,
+                process_runner=stoppable_run_process,
+                report_progress=True,
             )
             validate_tool = validate_tool or MediaValidateTool(
                 config_path=config_path, process_runner=stoppable_run_process
@@ -126,6 +149,15 @@ class VideoRenderHandler:
             )
 
         context.note(RENDER_STARTED_NOTE)
+        context.progress(STAGE_RENDER, 0.0)
+        expected = expected_duration(plan)
+
+        def on_encoded(seconds: float) -> None:
+            if expected:
+                share = min(seconds / expected, 1.0) * RENDER_SHARE
+                context.progress(STAGE_RENDER, share)
+
+        _render_progress.callback = on_encoded
         try:
             render = _report(self._render.execute(plan=plan))
         except JobCancelled:
@@ -140,6 +172,8 @@ class VideoRenderHandler:
                 "The worker was stopped during the render; nothing was published",
                 {"stage": "during_render", "output": None, "ready_for_review": False},
             )
+        finally:
+            _render_progress.callback = None
         render_status = render.get("render_status")
         output = render.get("output") if isinstance(render.get("output"), dict) else {}
         file_name = output.get("file")
@@ -170,6 +204,7 @@ class VideoRenderHandler:
             return JobOutcome.failed(code, message, result)
 
         context.note(f"{RENDERED_NOTE_PREFIX}{file_name}")
+        context.progress(STAGE_VALIDATE, RENDER_SHARE)
         unvalidated = (
             f"{file_name} was published but not validated; it is not ready for review."
         )
@@ -279,12 +314,31 @@ def stoppable_run_process(
 ) -> int:
     """The tools' ``process_runner`` hook, stoppable by the running job.
 
+    While a job renders with ``report_progress``, it also follows FFmpeg's
+    ``-progress`` file and passes the encoded time to the handler.
     Outside a job it behaves like ``run_process``.  Inside one, a cancel
     request or a forced worker stop terminates FFmpeg's process group (the
     existing ``_stop``: SIGTERM, then SIGKILL) and raises
     :class:`JobCancelled` or :class:`WorkerInterrupted`.  The render tool's
     cleanup then removes its temp folder, so nothing is published.
     """
+    on_encoded = getattr(_render_progress, "callback", None)
+    reader = (
+        ProgressReader(Path(cwd) / PROGRESS_FILENAME)
+        if on_encoded is not None and "-progress" in cmd
+        else None
+    )
+
+    def should_stop() -> Optional[str]:
+        if reader is not None:
+            seconds = reader.poll()
+            if seconds is not None:
+                try:
+                    on_encoded(seconds)
+                except Exception:  # progress must never break a render
+                    logger.warning("Render progress callback failed", exc_info=True)
+        return current_stop_reason()
+
     try:
         return run_process_until(
             cmd,
@@ -292,12 +346,28 @@ def stoppable_run_process(
             timeout=timeout,
             log_path=log_path,
             env=env,
-            should_stop=current_stop_reason,
+            should_stop=should_stop,
         )
     except ProcessStopped as exc:
         if exc.reason == STOP_CANCEL:
             raise JobCancelled() from None
         raise WorkerInterrupted() from None
+
+
+def expected_duration(plan: Mapping[str, Any]) -> Optional[float]:
+    """Total output duration of a raw plan (sum of clip lengths), or ``None``.
+
+    Uses the plan module's own timestamp parser; the render tool still
+    validates the plan in full.
+    """
+    try:
+        total = sum(
+            parse_timestamp(clip["end"]) - parse_timestamp(clip["start"])
+            for clip in plan["clips"]
+        )
+    except (KeyError, TypeError, ValueError, PlanError):
+        return None
+    return total if total > 0 else None
 
 
 def abandoned_after(settings: Any) -> float:
@@ -476,6 +546,8 @@ def _validate_summary(report: Mapping[str, Any]) -> Dict[str, Any]:
 
 __all__ = [
     "KIND",
+    "RENDER_SHARE",
+    "expected_duration",
     "abandoned_after",
     "remove_abandoned_temp_dirs",
     "stoppable_run_process",

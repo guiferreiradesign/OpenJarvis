@@ -31,6 +31,15 @@ process control running inside the handler (FFmpeg) ask whether to stop:
 ``"cancel"`` after a cancel request, ``"shutdown"`` after a forced worker
 stop.
 
+**Progress.**  Handlers call ``context.progress(stage, percent)``; the
+percentage is of the whole job, never decreases, and stays below 100 until
+the store records a successful completion.  Writes are throttled (a stage
+change at once; otherwise at most one per ``progress_min_interval`` and
+only after a ``progress_min_step`` gain).  Each write, the claim and the
+final status are published on the OpenJarvis event bus as
+:data:`JOB_PROGRESS_EVENT`; a failing bus or subscriber is logged and
+never affects the job.
+
 ``KeyboardInterrupt``/``SystemExit`` are not caught: the job then stays
 ``running`` and is recovered by the next worker, rather than being
 recorded with an outcome nobody observed.
@@ -50,7 +59,9 @@ from jarvis_ext.jobs.models import (
     Job,
     JobError,
     clean_error_message,
+    clean_progress,
     validate_error_code,
+    validate_stage,
 )
 from jarvis_ext.jobs.store import JobStore
 
@@ -64,6 +75,11 @@ _ACTIONS = frozenset({SUCCEEDED, FAILED, RETRY, CANCELLED})
 
 STOP_CANCEL = "cancel"
 STOP_SHUTDOWN = "shutdown"
+
+# Custom event type, a plain string like the upstream scheduler's
+# "scheduler_task_start" (the core EventType enum is not edited).
+JOB_PROGRESS_EVENT = "jarvis_job_progress"
+_DEFAULT_BUS = object()
 
 _active = threading.local()
 
@@ -125,8 +141,42 @@ class JobContext:
     notes: list = field(default_factory=list)
     shutdown: Optional[threading.Event] = None
     cancel_poll_seconds: float = 0.5
+    bus: Any = None
+    progress_min_step: float = 1.0
+    progress_min_interval: float = 1.0
     _cancel_seen: bool = field(default=False, repr=False)
     _cancel_checked: float = field(default=float("-inf"), repr=False)
+    _progress: Optional[float] = field(default=None, repr=False)
+    _stage: Optional[str] = field(default=None, repr=False)
+    _progress_at: float = field(default=float("-inf"), repr=False)
+
+    def progress(self, stage: str, percent: float) -> None:
+        """Report the job's stage and overall percentage (best effort).
+
+        Never raises: a bad value or a busy database is logged and skipped.
+        """
+        try:
+            value = clean_progress(percent)
+            validate_stage(stage)
+        except InvalidJobError as exc:
+            logger.warning("Ignoring progress for job %s: %s", self.job.id, exc)
+            return
+        value = max(value, self._progress or 0.0)
+        now = time.monotonic()
+        if stage == self._stage and (
+            value - (self._progress or 0.0) < self.progress_min_step
+            or now - self._progress_at < self.progress_min_interval
+        ):
+            return
+        try:
+            job = self.store.report_progress(
+                self.job.id, self.worker_id, stage=stage, progress=value
+            )
+        except JobError as exc:
+            logger.warning("Progress for job %s not recorded: %s", self.job.id, exc)
+            return
+        self._progress, self._stage, self._progress_at = job.progress, job.stage, now
+        publish_progress(self.bus, job)
 
     def cancel_requested(self) -> bool:
         """Re-read the store; handlers call this between stages."""
@@ -164,6 +214,31 @@ class JobContext:
 
 class JobHandler(Protocol):
     def run(self, context: JobContext) -> JobOutcome: ...
+
+
+def publish_progress(bus: Any, job: Job) -> None:
+    """Publish a job's status/stage/progress; never raises."""
+    if bus is None:
+        return
+    try:
+        bus.publish(
+            JOB_PROGRESS_EVENT,
+            {
+                "job_id": job.id,
+                "kind": job.kind,
+                "status": job.status.value,
+                "stage": job.stage,
+                "progress": job.progress,
+                "attempt": job.attempts,
+            },
+        )
+    except Exception:
+        logger.warning("Publishing progress for job %s failed", job.id, exc_info=True)
+
+
+def current_context() -> Optional[JobContext]:
+    """The job context running in this thread, if any."""
+    return getattr(_active, "context", None)
 
 
 def current_stop_reason() -> Optional[str]:
@@ -210,6 +285,8 @@ def run_next(
     retry_delay_seconds: float = 0.0,
     heartbeat_seconds: Optional[float] = None,
     shutdown: Optional[threading.Event] = None,
+    bus: Any = _DEFAULT_BUS,
+    progress_interval: float = 1.0,
 ) -> Optional[Job]:
     """Claim and run the oldest queued job of a kind in *handlers*.
 
@@ -217,14 +294,26 @@ def run_next(
     queued.  Runs at most one job.  A ``retry`` outcome is not claimed again
     for *retry_delay_seconds*.  With *heartbeat_seconds*, a heartbeat is
     recorded at that interval while the handler runs.  Setting *shutdown*
-    makes :func:`current_stop_reason` report ``"shutdown"``.
+    makes :func:`current_stop_reason` report ``"shutdown"``.  Progress
+    events go to *bus* (default: the OpenJarvis event bus; ``None`` for none),
+    at most one per *progress_interval* seconds within a stage.
     """
     if not handlers:
         return None
+    if bus is _DEFAULT_BUS:
+        bus = _default_bus()
     job = store.claim_next(worker_id, kinds=list(handlers))
     if job is None:
         return None
-    context = JobContext(job=job, store=store, worker_id=worker_id, shutdown=shutdown)
+    publish_progress(bus, job)
+    context = JobContext(
+        job=job,
+        store=store,
+        worker_id=worker_id,
+        shutdown=shutdown,
+        bus=bus,
+        progress_min_interval=progress_interval,
+    )
     heartbeat = (
         _Heartbeat(store, job, worker_id, heartbeat_seconds)
         if heartbeat_seconds
@@ -258,9 +347,21 @@ def run_next(
             f"The {job.kind} handler returned {type(outcome).__name__}, "
             "not a JobOutcome",
         )
-    return record_outcome(
+    final = record_outcome(
         store, job, worker_id, outcome, retry_delay_seconds=retry_delay_seconds
     )
+    publish_progress(bus, final)
+    return final
+
+
+def _default_bus() -> Any:
+    try:
+        from openjarvis.core.events import get_event_bus
+
+        return get_event_bus()
+    except Exception:  # pragma: no cover - the core always provides one
+        logger.warning("No event bus available; progress events are off")
+        return None
 
 
 def record_outcome(
@@ -330,6 +431,9 @@ def _apply(
 
 
 __all__ = [
+    "JOB_PROGRESS_EVENT",
+    "current_context",
+    "publish_progress",
     "STOP_CANCEL",
     "STOP_SHUTDOWN",
     "WorkerInterrupted",

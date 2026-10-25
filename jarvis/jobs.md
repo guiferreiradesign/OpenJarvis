@@ -4,13 +4,14 @@ Phase 3 turns long-running work into **jobs**, starting with renders. A job
 is tracked from submission to a final status, can be cancelled, and is
 retried only when that is safe.
 
-**What exists today (steps 1–3):** the job model, its status rules, the
+**What exists today (steps 1–4):** the job model, its status rules, the
 SQLite job store, a runner that executes one `video.render` job through
-the existing render and validate tools, and a worker with a `jobs` CLI
-(submit, list, show, cancel, worker). There is no progress reporting,
-notification or agent tool yet; those are steps 4–7 in
-[ROADMAP.md](ROADMAP.md). The Phase 2 render pipeline is unchanged apart
-from one additive process-control function (D29).
+the existing render and validate tools, a worker with a `jobs` CLI
+(submit, list, show, cancel, worker), and progress reporting from
+FFmpeg's real encoding position. There is no notification or agent tool
+yet; those are steps 5–7 in [ROADMAP.md](ROADMAP.md). The Phase 2 render
+pipeline is unchanged apart from two additive, opt-in hooks: a stoppable
+process runner (D29) and FFmpeg's `-progress` report (D30).
 
 The job layer is shared by every JARVIS skill. It knows nothing about video,
 FFmpeg, HyperFrames or notifications (DECISIONS.md D25):
@@ -39,6 +40,7 @@ existing tools (media_render, media_validate)
 | `parent_id` | The job this one revises, if any (D22). Must exist |
 | `attempts`, `max_attempts` | Runs started so far; limit 1–2 (D23) |
 | `cancel_requested` | Set when you cancel a running job |
+| `stage`, `progress` | The running stage (e.g. `render`, `validate`) and the percentage of the whole job, 0–100; see "Progress" |
 | `claimed_by` | The worker running it |
 | `result` | JSON object from the runner when it succeeds (for video: output file, checksum, preview…) |
 | `error_code`, `error_message` | Last failure, e.g. `ffmpeg_failed`; message truncated to 4000 characters |
@@ -163,7 +165,8 @@ to stderr: exit status 1 for an error (unknown job, bad plan, config
 error, another worker running), 2 for invalid arguments. Output contains
 job ids, workspace-relative plan paths and output file names only, never
 absolute paths. The worker logs one line per job to stderr and prints a
-report (`processed`, `recovered`, `cleaned_temp_dirs`, `stopped`) when it
+report (`processed`, `recovered`, `cleaned_temp_dirs`, `stopped`; each job
+with its `stage` and `progress`) when it
 exits.
 
 **One worker, one job at a time.** The worker takes an exclusive `flock`
@@ -218,6 +221,61 @@ running tool call can be that old (FFmpeg is stopped at its timeouts), and
 a folder an orphaned FFmpeg is still writing to stays because its files
 are recent. Symlinks are never followed, and renders, records and
 `review/` files are never candidates.
+
+## Progress (step 4)
+
+A running job has a **stage** and a **progress** percentage for the whole
+job. For `video.render`:
+
+| Stage | Progress | Where it comes from |
+|---|---|---|
+| (claimed) | 0 | the claim |
+| `render` | 0 → 95 | FFmpeg's own `-progress` report: the encoded output time (`out_time_us`) divided by the plan's total duration (sum of clip lengths), × 95 |
+| `validate` | 95 | held while `media_validate` runs; validation has no measurable progress, so none is invented |
+| (succeeded) | 100 | recorded by the store only when the job succeeds |
+
+Rules (generic, for every job kind):
+
+* **Never decreases** within an attempt; a lower report keeps the current
+  value. A job requeued for another attempt starts again from 0 (its
+  previous value is cleared when it is requeued).
+* **Below 100 while running**: anything ≥ 99 is stored as 99. Only a
+  successful completion records 100, so a failed, cancelled or
+  interrupted job never shows 100; it keeps the stage and percentage it
+  reached, which is useful diagnostics.
+* **Throttled**: a stage change is written at once; otherwise at most one
+  write per second, and only after a gain of at least one point. FFmpeg
+  writes its report about twice a second; the worker reads it while it
+  checks for cancellation (every 0.25 s).
+* **FFmpeg's report is evidence of encoding speed only.** Reaching 95 %
+  does not mean the file is good; the render's own checks and validation
+  still decide success.
+* Missing, malformed, partial, `N/A`, duplicated or out-of-order lines in
+  the report are ignored (`video.ffmpeg.ProgressReader`). If the plan's
+  duration cannot be worked out, the render stage stays at 0 until it
+  finishes.
+* A stage change is also written to the job's history (`stage render`,
+  `stage validate`); individual percentages are not.
+
+**Watching progress:** `jobs list` and `jobs show` include `stage` and
+`progress`, for example `"stage": "render", "progress": 47.5`.
+
+**Event bus:** the runner publishes a custom event,
+`jarvis_job_progress` (a plain string, like the upstream scheduler's
+`scheduler_task_start`), when a job is claimed, on each progress write and
+when the job reaches its next status. The data is
+`{job_id, kind, status, stage, progress, attempt}`: no paths, no payload.
+A failing bus or subscriber is logged and never affects the job. The
+OpenJarvis event bus is in-process, so subscribers must run inside the
+worker process; other processes (the CLI) read progress from the job
+database.
+
+```python
+from openjarvis.core.events import get_event_bus
+from jarvis_ext.jobs.runner import JOB_PROGRESS_EVENT
+
+get_event_bus().subscribe(JOB_PROGRESS_EVENT, lambda e: print(e.data))
+```
 
 ## Storage and safety
 
@@ -276,8 +334,17 @@ with open_job_store() as store:                  # reads [jarvis.jobs]
 
 ```bash
 uv run pytest tests/jarvis_ext/test_job_store.py tests/jarvis_ext/test_job_runner.py \
-    tests/jarvis_ext/test_job_worker.py -v
+    tests/jarvis_ext/test_job_worker.py tests/jarvis_ext/test_job_progress.py -v
 ```
+
+`test_job_progress.py` covers parsing FFmpeg's progress report (partial,
+malformed, `N/A`, duplicated, out-of-order and replaced files), the
+unchanged default render command, store rules (monotonic, capped, 100
+only on success, reset on requeue), throttling, events, a broken bus or
+subscriber, the handler's stages, and the CLI. Its real-FFmpeg tests
+check that a real render reports intermediate progress and only reaches
+100 after validation, and that a cancellation after real progress stops
+FFmpeg and publishes nothing.
 
 `test_job_worker.py` covers schema upgrade, heartbeat, back-off,
 recovery, the stoppable process runner, temp-folder cleanup, the worker
@@ -318,6 +385,12 @@ claiming across threads and processes, and `[jarvis.jobs]` settings.
 * **A forced stop or a crash uses an attempt.** With `max_attempts = 2`,
   a job interrupted twice fails.
 * **macOS and Linux only.** The worker lock uses `fcntl.flock`.
+* **Progress events are in-process.** Only code running in the worker
+  process sees `jarvis_job_progress`; the CLI reads the database.
+* **The render percentage assumes encoding speed is even.** FFmpeg reports
+  the time encoded so far; scenes that encode slower or faster make the
+  percentage move unevenly. Probing before FFmpeg starts and publishing
+  after it ends are not measured.
 * **Python 3.10 is not verified.** The project supports Python 3.10–3.13;
   the job code was only tested on Python 3.13 (3.10 is not installed here).
 * **Run jobs through the worker.** Calling `run_next` directly, without the

@@ -37,6 +37,11 @@ MAX_WORKER_ID_LENGTH = 128
 # Dotted lower-case names, e.g. "video.render" or "research.report".
 _KIND_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$")
 _ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_STAGE_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+
+# Progress is a percentage of the whole job.  While a job runs it stays
+# below 100; only a successful completion records 100.
+MAX_RUNNING_PROGRESS = 99.0
 
 
 class JobError(Exception):
@@ -131,6 +136,21 @@ def validate_worker_id(worker_id: Any) -> str:
     return worker_id
 
 
+def validate_stage(stage: Any) -> str:
+    if not isinstance(stage, str) or not _STAGE_RE.match(stage):
+        raise InvalidJobError("Stage must be a short lower-case name such as 'render'")
+    return stage
+
+
+def clean_progress(progress: Any) -> float:
+    """A running job's percentage: finite, clamped to 0–``MAX_RUNNING_PROGRESS``."""
+    if isinstance(progress, bool) or not isinstance(progress, (int, float)):
+        raise InvalidJobError("Progress must be a number")
+    if progress != progress or progress in (float("inf"), float("-inf")):
+        raise InvalidJobError("Progress must be a finite number")
+    return round(min(max(float(progress), 0.0), MAX_RUNNING_PROGRESS), 1)
+
+
 def clean_error_message(message: Any) -> str:
     if not isinstance(message, str):
         raise InvalidJobError("Error message must be a string")
@@ -181,6 +201,8 @@ class Job:
     finished_at: Optional[str]
     heartbeat_at: Optional[str] = None
     not_before: Optional[str] = None
+    progress: Optional[float] = None
+    stage: Optional[str] = None
 
     @property
     def is_final(self) -> bool:
@@ -206,6 +228,8 @@ class Job:
             "finished_at": self.finished_at,
             "heartbeat_at": self.heartbeat_at,
             "not_before": self.not_before,
+            "progress": self.progress,
+            "stage": self.stage,
         }
 
 

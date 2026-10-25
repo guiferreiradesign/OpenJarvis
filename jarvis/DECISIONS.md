@@ -378,6 +378,42 @@ That needs a job id in the render record (D24). It is optional and was not
 approved for this step; the conservative policy above never duplicates a
 known render, and the remaining window is documented in jobs.md.
 
+## D30. Progress: FFmpeg's own report, one generic percentage, 100 only on success
+
+**Decision:**
+
+* **Source:** FFmpeg's `-progress` report (`out_time_us` per block),
+  written to `progress.txt` in the render's private temp folder. This is
+  the "FFmpeg progress reporting" option D24 anticipated: the render tool
+  gains `report_progress` (default **off**) and `build_render_command`
+  gains `progress` (default off); off, the command is byte-for-byte
+  unchanged (tested). Only the job handler turns it on. No second render
+  implementation, no new dependency.
+* **Reading:** `stoppable_run_process` (D29) already polls every 0.25 s for
+  cancellation; it now also reads new lines of the report with
+  `ProgressReader` (complete blocks only, never decreasing, tolerant of
+  junk) and hands the encoded time to the handler. Cancellation and
+  cleanup are unchanged.
+* **Model:** schema v3 adds `progress` (percent of the whole job) and
+  `stage` (a short name; the store knows nothing about FFmpeg). The store
+  enforces: monotonic per attempt, ≤ 99 while running, 100 only in
+  `complete`, cleared when requeued. Stage changes go into the history.
+* **Video mapping:** `render` 0–95 % by encoded time ÷ plan duration;
+  `validate` holds at 95 % because validation has no meaningful measure;
+  100 % only after the validator confirmed success.
+* **Throttling:** stage changes at once; otherwise ≥ 1 point and ≥ 1 s
+  apart (both), so a long render writes and publishes at most once a
+  second.
+* **Events:** custom string event `jarvis_job_progress` on the OpenJarvis
+  event bus (no core enum change, like the scheduler's events), published
+  at claim, on each write and at the next status. Publishing is wrapped so
+  neither the bus nor a subscriber can affect the job (the core bus's own
+  error logging assumes enum event types, so this wrapper matters).
+
+**Why one percentage for the whole job:** a single number is what a list
+or dashboard shows; the stage says what it means, and other skills can
+use the same two fields with their own stages.
+
 ## Assumptions
 
 * Only you (and processes you trust) write to the media workspace. See the

@@ -33,6 +33,7 @@ from jarvis_ext.video.plan import EditPlan
 RENDER_FILENAME = "render.mp4"
 SUBTITLE_FILENAME = "subs.srt"
 LOG_FILENAME = "ffmpeg.log"
+PROGRESS_FILENAME = "progress.txt"
 PREVIEW_FILENAME = "preview.mp4"
 THUMBNAIL_FILENAME = "thumbnail.jpg"
 
@@ -385,14 +386,22 @@ def build_render_command(
     *,
     logo: Optional[LogoInput] = None,
     capabilities: Optional[FfmpegCapabilities] = None,
+    progress: bool = False,
 ) -> List[str]:
-    """Complete argument list for one render, run with cwd = render dir."""
+    """Complete argument list for one render, run with cwd = render dir.
+
+    With *progress*, FFmpeg also writes its ``-progress`` key=value report to
+    :data:`PROGRESS_FILENAME` in the render dir (read by
+    :class:`ProgressReader`).  Without it the command is exactly as before.
+    """
     if len(clips) != len(plan.clips):
         raise ValueError("every plan clip needs a resolved input")
     if plan.branding is not None and logo is None:
         raise ValueError("branding requested without a logo input")
 
     cmd: List[str] = [ffmpeg, "-hide_banner", "-nostdin", "-nostats", "-v", "error"]
+    if progress:
+        cmd += ["-progress", f"file:{PROGRESS_FILENAME}"]
     for clip in clips:
         cmd += _input_args(clip.path, start=clip.start, duration=clip.duration)
     next_input = len(clips)
@@ -583,6 +592,87 @@ def run_process(
             raise
 
 
+class ProgressReader:
+    """Follows FFmpeg's ``-progress`` file and reports the encoded time.
+
+    FFmpeg appends blocks of ``key=value`` lines, each ending with
+    ``progress=continue`` (or ``progress=end``), about twice a second.  Only
+    complete blocks count; a partly written last line is kept for the next
+    read.  Unknown keys, malformed lines and ``N/A`` values are ignored.
+    The reported time never decreases, so duplicated or out-of-order blocks
+    cannot move progress backwards.  A file that shrinks (replaced) is read
+    again from the start, still without going backwards.
+
+    This only says how far the encoder has got.  It is not evidence that
+    the output is complete or valid; the render's checks and validation
+    decide that.
+    """
+
+    _MAX_READ = 1024 * 1024  # per poll; the file grows by ~300 bytes a block
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.out_time: Optional[float] = None
+        self.ended = False
+        self._offset = 0
+        self._partial = b""
+        self._block_time: Optional[float] = None
+
+    def poll(self) -> Optional[float]:
+        """Read what FFmpeg wrote since the last call; return the time so far."""
+        try:
+            with open(self.path, "rb") as fh:
+                size = os.fstat(fh.fileno()).st_size
+                if size < self._offset:
+                    self._offset, self._partial, self._block_time = 0, b"", None
+                fh.seek(self._offset)
+                data = fh.read(self._MAX_READ)
+        except OSError:
+            return self.out_time  # not created yet, or gone
+        self._offset += len(data)
+        self.feed(data)
+        return self.out_time
+
+    def feed(self, data: bytes) -> None:
+        lines = (self._partial + data).split(b"\n")
+        self._partial = lines.pop()
+        if len(self._partial) > 4096:  # no real line is this long
+            self._partial = b""
+        for raw in lines:
+            key, sep, value = raw.decode("utf-8", "replace").strip().partition("=")
+            if not sep:
+                continue
+            if key == "out_time_us":
+                seconds = _microseconds(value)
+                if seconds is not None:
+                    self._block_time = seconds
+            elif key == "out_time" and self._block_time is None:
+                self._block_time = _clock_time(value)
+            elif key == "progress":
+                if self._block_time is not None:
+                    if self.out_time is None or self._block_time > self.out_time:
+                        self.out_time = self._block_time
+                if value == "end":
+                    self.ended = True
+                self._block_time = None
+
+
+def _microseconds(value: str) -> Optional[float]:
+    try:
+        number = int(value)
+    except ValueError:
+        return None  # "N/A" before the first frame
+    return max(0.0, number / 1_000_000)
+
+
+def _clock_time(value: str) -> Optional[float]:
+    match = re.fullmatch(r"-?(\d+):(\d{2}):(\d{2}(?:\.\d+)?)", value)
+    if not match or value.startswith("-"):
+        return 0.0 if match else None
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
 class ProcessStopped(Exception):
     """Raised by :func:`run_process_until` after it stopped the process."""
 
@@ -667,6 +757,8 @@ __all__ = [
     "LOG_FILENAME",
     "LogoInput",
     "PREVIEW_FILENAME",
+    "PROGRESS_FILENAME",
+    "ProgressReader",
     "ProcessRunner",
     "ProcessStopped",
     "RENDER_FILENAME",

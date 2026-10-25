@@ -197,6 +197,11 @@ render = MediaRenderTool().execute(plan={...})          # or plan='{"output_name
 check = MediaValidateTool().execute(output="skyline_reel_v001.mp4")
 ```
 
+`MediaRenderTool(report_progress=True)` additionally asks FFmpeg for its
+`-progress` report in the render's temp folder (used by the Phase 3 job
+runner; see jobs.md). It is off by default, and the render command is then
+unchanged.
+
 ### `media_render` result
 
 ```json

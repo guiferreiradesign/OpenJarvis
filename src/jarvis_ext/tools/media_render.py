@@ -75,6 +75,13 @@ class MediaRenderTool(VideoToolBase):
     tool_id = TOOL_NAME
     status_key = "render_status"
 
+    def __init__(self, *, report_progress: bool = False, **kwargs: Any) -> None:
+        """*report_progress* adds FFmpeg's ``-progress`` report to the render
+        command (used by the job runner); off by default, so the command is
+        otherwise unchanged."""
+        super().__init__(**kwargs)
+        self._report_progress = report_progress
+
     @property
     def spec(self) -> ToolSpec:
         presets = ", ".join(sorted(self._settings.presets))
@@ -356,7 +363,12 @@ class MediaRenderTool(VideoToolBase):
             if subtitles is not None:
                 (temp_dir / SUBTITLE_FILENAME).write_text(subtitles, encoding="utf-8")
             cmd = build_render_command(
-                ffmpeg, plan, clips, logo=logo, capabilities=capabilities
+                ffmpeg,
+                plan,
+                clips,
+                logo=logo,
+                capabilities=capabilities,
+                progress=self._report_progress,
             )
             try:
                 code = self._process_runner(

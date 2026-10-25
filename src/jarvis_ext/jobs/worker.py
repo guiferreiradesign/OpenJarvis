@@ -132,6 +132,8 @@ def job_summary(job: Job) -> Dict[str, Any]:
         "id": job.id,
         "kind": job.kind,
         "status": job.status.value,
+        "stage": job.stage,
+        "progress": job.progress,
         "attempts": f"{job.attempts}/{job.max_attempts}",
         "output": result.get("output"),
         "ready_for_review": result.get("ready_for_review"),

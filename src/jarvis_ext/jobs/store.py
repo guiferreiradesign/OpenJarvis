@@ -45,9 +45,11 @@ from jarvis_ext.jobs.models import (
     JobStatus,
     check_transition,
     clean_error_message,
+    clean_progress,
     encode_json_object,
     validate_error_code,
     validate_kind,
+    validate_stage,
     validate_worker_id,
 )
 from jarvis_ext.jobs.settings import JobSettings
@@ -57,7 +59,7 @@ logger = logging.getLogger(__name__)
 MAX_NOTE_CHARS = 500
 _ID_PREFIX_RE = re.compile(r"^[0-9a-fA-F]{6,32}$")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_RETRY_DELAY_SECONDS = 86400.0
 # "JRVJ" — marks the file as a JARVIS job database (PRAGMA application_id).
 APPLICATION_ID = 0x4A52564A
@@ -110,6 +112,11 @@ _MIGRATIONS: dict = {
     1: (
         "ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT",
         "ALTER TABLE jobs ADD COLUMN not_before TEXT",
+    ),
+    # Phase 3 step 4: progress (percent of the whole job) and current stage.
+    2: (
+        "ALTER TABLE jobs ADD COLUMN progress REAL",
+        "ALTER TABLE jobs ADD COLUMN stage TEXT",
     ),
 }
 
@@ -305,8 +312,8 @@ class JobStore:
             job_id = row["id"]
             cursor = conn.execute(
                 "UPDATE jobs SET status = ?, claimed_by = ?, attempts = attempts + 1, "
-                "started_at = ?, updated_at = ?, heartbeat_at = ?, not_before = NULL "
-                "WHERE id = ? AND status = ?",
+                "started_at = ?, updated_at = ?, heartbeat_at = ?, not_before = NULL, "
+                "progress = 0, stage = NULL WHERE id = ? AND status = ?",
                 (
                     JobStatus.RUNNING.value,
                     worker_id,
@@ -337,7 +344,7 @@ class JobStore:
             job_id,
             worker_id,
             JobStatus.SUCCEEDED,
-            {"result": _encode_result(result)},
+            {"result": _encode_result(result), "progress": 100.0},
             "succeeded",
         )
 
@@ -402,6 +409,8 @@ class JobStore:
                     "started_at": None,
                     "heartbeat_at": None,
                     "not_before": self._after(delay),
+                    "progress": None,
+                    "stage": None,
                     "error_code": code,
                     "error_message": message,
                 },
@@ -467,6 +476,38 @@ class JobStore:
                 "UPDATE jobs SET heartbeat_at = ? WHERE id = ? AND status = ?",
                 (now, job_id, JobStatus.RUNNING.value),
             )
+            return self._get(conn, job_id)
+
+    def report_progress(
+        self, job_id: str, worker_id: str, *, stage: str, progress: float
+    ) -> Job:
+        """Record a running job's stage and percentage (0–99).
+
+        Progress never decreases: a lower value keeps the current one.  100
+        is only ever recorded by :meth:`complete`.  A change of stage is
+        also written to the job's history.  Only the claiming worker may
+        report.
+        """
+        validate_worker_id(worker_id)
+        stage = validate_stage(stage)
+        value = clean_progress(progress)
+        with self._write() as conn:
+            job = self._get(conn, job_id)
+            if job.status is not JobStatus.RUNNING or job.claimed_by != worker_id:
+                raise InvalidTransitionError(
+                    "Only the worker running a job can report its progress"
+                )
+            value = max(value, job.progress or 0.0)
+            if value == job.progress and stage == job.stage:
+                return job
+            now = self._clock()
+            conn.execute(
+                "UPDATE jobs SET progress = ?, stage = ?, updated_at = ? "
+                "WHERE id = ? AND status = ?",
+                (value, stage, now, job_id, JobStatus.RUNNING.value),
+            )
+            if stage != job.stage:
+                self._event(conn, job_id, job.status, job.status, f"stage {stage}", now)
             return self._get(conn, job_id)
 
     # -- recovery ------------------------------------------------------------
@@ -538,6 +579,8 @@ class JobStore:
                         "started_at": None,
                         "heartbeat_at": None,
                         "not_before": self._after(delay),
+                        "progress": None,
+                        "stage": None,
                         "error_code": code,
                         "error_message": message,
                     },
@@ -857,6 +900,8 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         finished_at=row["finished_at"],
         heartbeat_at=row["heartbeat_at"],
         not_before=row["not_before"],
+        progress=row["progress"],
+        stage=row["stage"],
     )
 
 
