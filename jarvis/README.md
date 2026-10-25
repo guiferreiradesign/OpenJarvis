@@ -9,6 +9,8 @@ untouched.
 |---|---|
 | [AUDIT.md](AUDIT.md) | What OpenJarvis actually provides (from reading the source), what is missing, and the Claude authentication findings |
 | [media-workspace.md](media-workspace.md) | The first JARVIS capability: read-only media-workspace inspection |
+| [video-pipeline.md](video-pipeline.md) | Phase 2: `EditPlan`, `media_render`, `media_validate`, output versioning and safety |
+| [examples/edit-plan.example.json](examples/edit-plan.example.json) | A complete example edit plan |
 | [DECISIONS.md](DECISIONS.md) | Architecture decisions and assumptions |
 | [ROADMAP.md](ROADMAP.md) | Phases 1–8 and the checklist of things to verify on the Mac |
 | [config.example.toml](config.example.toml) | Example `[jarvis.*]` configuration |
@@ -25,9 +27,20 @@ src/jarvis_ext/            # JARVIS extension package (custom code only)
     __init__.py            #   registers extension tools; ensure_registered()
     __main__.py            #   `python -m jarvis_ext ...` runner (no LLM needed)
     config.py              #   reads [jarvis.<name>] sections from config.toml
+    _workspace.py          #   shared path safety (relative paths, symlinks, overlap)
     tools/
         __init__.py        #   tool table -> OpenJarvis ToolRegistry
-        media_workspace.py #   media_workspace_inspect tool
+        media_workspace.py #   media_workspace_inspect tool (+ shared probe_media)
+        _video_base.py     #   config/FFmpeg plumbing shared by render/validate
+        media_render.py    #   media_render tool
+        media_validate.py  #   media_validate tool
+    video/                 #   deterministic pipeline used by the tools
+        plan.py            #     EditPlan model, presets, timestamp parsing
+        settings.py        #     [jarvis.media_render] settings
+        output.py          #     output folder: temp dirs, versions, publishing
+        ffmpeg.py          #     FFmpeg argument lists, capabilities, process control
+        subtitles.py       #     SRT parsing/sanitising, transcription hook
+        checks.py          #     output-vs-plan checks
 tests/jarvis_ext/          # tests for the extension package
 jarvis/                    # this documentation
 ```
@@ -52,7 +65,7 @@ The fork touches upstream files in exactly two places:
                                                                                                 ▼
                 ┌──────────── JARVIS extensions (src/jarvis_ext) ────────────┐
                 │  media_workspace_inspect   (Phase 1, implemented)           │
-                │  media render / validate   (Phase 2, planned)               │
+                │  media_render / validate   (Phase 2, implemented)           │
                 │  job status, notifications (Phase 3, planned)               │
                 └─────────────────────────────────────────────────────────────┘
    later:  Mac worker (Phase 4)  ◄── secure channel ──►  cloud orchestrator (Phase 5)
@@ -83,7 +96,8 @@ The fork touches upstream files in exactly two places:
 | Approvals | **Partial upstream** | Interactive confirmation + a proactive-agent approval queue with REST routes |
 | Voice | **Available upstream** | Whisper STT and several TTS backends (some paid) |
 | Email / notifications | **Available upstream** (channels) | Not configured; sending is out of scope for Phase 1 |
-| Video rendering / editing | **Planned** | Phase 2 |
+| Video rendering from an explicit edit plan | **Implemented** (JARVIS) | `media_render` + `media_validate`, 1080×1920 Reels preset, versioned outputs, preview/thumbnail. Real-FFmpeg tested on macOS with generated media. See video-pipeline.md |
+| Autonomous editing ("strongest moments") | **Planned** | Phase 8 |
 | Custom dashboard | **Planned** | Phase 7 |
 
 ## Quick start
@@ -100,6 +114,18 @@ root = "/Users/you/Movies/JARVIS"         # a dedicated folder, not your home di
 EOF
 uv run python -m jarvis_ext media-inspect                # whole workspace
 uv run python -m jarvis_ext media-inspect "Skyline" --video
+```
+
+To render (Phase 2), add an existing output folder outside the workspace
+and run a plan (see [video-pipeline.md](video-pipeline.md)):
+
+```bash
+mkdir -p ~/Movies/JARVIS-Renders
+cat >> ~/.openjarvis/config.toml <<'EOF'
+[jarvis.media_render]
+output_root = "/Users/you/Movies/JARVIS-Renders"
+EOF
+uv run python -m jarvis_ext media-render plan.json --validate
 ```
 
 To let an agent use the tool, enable it like any other tool:

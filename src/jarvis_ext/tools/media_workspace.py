@@ -42,9 +42,12 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
+from jarvis_ext._workspace import AccessDenied as _AccessDenied
+from jarvis_ext._workspace import is_within as _is_within
+from jarvis_ext._workspace import resolve_relative
 from jarvis_ext.config import ExtensionConfigError, load_extension_section
 from openjarvis.core.types import ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
@@ -311,6 +314,12 @@ def _rotation(stream: Mapping[str, Any]) -> int:
     return 0
 
 
+def _stream_duration(stream: Mapping[str, Any]) -> Optional[float]:
+    """Per-stream duration; can differ from the container's (e.g. short video)."""
+    duration = _to_float(stream.get("duration"))
+    return round(duration, 3) if duration is not None else None
+
+
 def _orientation(width: int, height: int) -> str:
     if width == height:
         return "square"
@@ -372,6 +381,7 @@ def parse_ffprobe_output(payload: Any) -> Dict[str, Any]:
             or _parse_rate(video.get("r_frame_rate")),
             "pixel_format": _safe_text(video.get("pix_fmt")),
             "rotation": _rotation(video),
+            "duration_seconds": _stream_duration(video),
         }
         if width and height:
             if info["rotation"] in (90, 270):
@@ -387,21 +397,97 @@ def parse_ffprobe_output(payload: Any) -> Dict[str, Any]:
             "sample_rate": _to_int(audio.get("sample_rate")),
             "channels": _to_int(audio.get("channels")),
             "channel_layout": _safe_text(audio.get("channel_layout")),
+            "duration_seconds": _stream_duration(audio),
         }
     return result
 
 
 # ---------------------------------------------------------------------------
-# The tool
+# ffprobe execution (shared with the render and validate tools)
 # ---------------------------------------------------------------------------
 
 
-class _AccessDenied(Exception):
-    """A requested path is not inside the authorised workspace."""
+def _clean_stderr(stderr: Any, path: Path, root: Path) -> str:
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    text = str(stderr or "").strip()
+    # Keep absolute paths out of model-facing output.
+    text = text.replace(f"file:{path}", path.name)
+    text = text.replace(str(root), "<workspace>")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    message = lines[-1] if lines else "ffprobe could not read this file"
+    return message[:_MAX_ERROR_CHARS]
 
 
-def _is_within(path: Path, root: Path) -> bool:
-    return path == root or path.is_relative_to(root)
+def probe_media(
+    ffprobe: str,
+    path: Path,
+    root: Path,
+    timeout: float,
+    runner: Runner = subprocess.run,
+) -> Dict[str, Any]:
+    """Run hardened ffprobe on *path* (inside *root*) and parse the result.
+
+    Never raises for media problems; the returned ``status`` says what
+    happened (see ``media-workspace.md``).
+    """
+    # Re-check just before handing the path to ffprobe to narrow the
+    # window in which the file could be swapped for an escaping link.
+    try:
+        info = path.lstat()
+    except OSError:
+        return {"status": "unreadable", "error": "File disappeared or unreadable"}
+    if not stat.S_ISREG(info.st_mode) or not _is_within(path.resolve(), root):
+        return {"status": "skipped", "error": "File changed during inspection"}
+
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-hide_banner",
+        "-protocol_whitelist",
+        "file",
+        "-format_whitelist",
+        FFPROBE_FORMAT_WHITELIST,
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        f"file:{path}",
+    ]
+    env = {"PATH": os.environ.get("PATH", os.defpath), "LC_ALL": "C"}
+    try:
+        proc = runner(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "error": f"ffprobe exceeded {timeout:.0f}s"}
+    except OSError as exc:
+        return {"status": "probe_failed", "error": type(exc).__name__}
+
+    if proc.returncode != 0:
+        return {
+            "status": "invalid_media",
+            "error": _clean_stderr(proc.stderr, path, root),
+        }
+    stdout = proc.stdout or b""
+    if len(stdout) > _MAX_PROBE_OUTPUT_BYTES:
+        return {"status": "invalid_media", "error": "ffprobe output too large"}
+    try:
+        payload = json.loads(stdout.decode("utf-8", errors="replace"))
+    except ValueError:
+        return {"status": "invalid_media", "error": "Unreadable ffprobe output"}
+    return parse_ffprobe_output(payload)
+
+
+# ---------------------------------------------------------------------------
+# The tool
+# ---------------------------------------------------------------------------
 
 
 def _error(message: str) -> ToolResult:
@@ -528,40 +614,9 @@ class MediaWorkspaceInspectTool(BaseTool):
 
     def _resolve_subpath(self, root: Path, subpath: str) -> Tuple[Path, Path]:
         """Map a workspace-relative *subpath* to ``(real path, display path)``."""
-        if not subpath or subpath == ".":
-            return root, Path(".")
-        if "\x00" in subpath:
-            raise _AccessDenied("Path contains a NUL character.")
-        if (
-            PurePosixPath(subpath).is_absolute()
-            or PureWindowsPath(subpath).is_absolute()
-            or PureWindowsPath(subpath).drive
-            or subpath.startswith("~")
-        ):
-            raise _AccessDenied("Use a path relative to the media workspace root.")
-        parts = [p for p in re.split(r"[\\/]+", subpath) if p not in ("", ".")]
-        if any(part == ".." for part in parts):
-            raise _AccessDenied("'..' is not allowed in workspace paths.")
-
-        current = root
-        for part in parts:
-            current = current / part
-            try:
-                info = current.lstat()
-            except FileNotFoundError:
-                raise FileNotFoundError(subpath) from None
-            if stat.S_ISLNK(info.st_mode):
-                if not self._settings.follow_symlinks:
-                    raise _AccessDenied(
-                        "Symbolic links are not followed in the media workspace."
-                    )
-                current = current.resolve(strict=True)
-                if not _is_within(current, root):
-                    raise _AccessDenied("Path leads outside the media workspace.")
-        resolved = current.resolve(strict=True)
-        if not _is_within(resolved, root):
-            raise _AccessDenied("Path leads outside the media workspace.")
-        return resolved, Path(*parts) if parts else Path(".")
+        return resolve_relative(
+            root, subpath, follow_symlinks=self._settings.follow_symlinks
+        )
 
     # -- enumeration --------------------------------------------------------
 
@@ -670,70 +725,7 @@ class MediaWorkspaceInspectTool(BaseTool):
         return shutil.which(self._settings.ffprobe_path or "ffprobe")
 
     def _probe(self, ffprobe: str, path: Path, root: Path, timeout: float) -> Dict:
-        # Re-check just before handing the path to ffprobe to narrow the
-        # window in which the file could be swapped for an escaping link.
-        try:
-            info = path.lstat()
-        except OSError:
-            return {"status": "unreadable", "error": "File disappeared or unreadable"}
-        if not stat.S_ISREG(info.st_mode) or not _is_within(path.resolve(), root):
-            return {"status": "skipped", "error": "File changed during inspection"}
-
-        cmd = [
-            ffprobe,
-            "-v",
-            "error",
-            "-hide_banner",
-            "-protocol_whitelist",
-            "file",
-            "-format_whitelist",
-            FFPROBE_FORMAT_WHITELIST,
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            f"file:{path}",
-        ]
-        env = {"PATH": os.environ.get("PATH", os.defpath), "LC_ALL": "C"}
-        try:
-            proc = self._runner(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=timeout,
-                check=False,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            return {"status": "timeout", "error": f"ffprobe exceeded {timeout:.0f}s"}
-        except OSError as exc:
-            return {"status": "probe_failed", "error": type(exc).__name__}
-
-        if proc.returncode != 0:
-            return {
-                "status": "invalid_media",
-                "error": self._clean_stderr(proc.stderr, path, root),
-            }
-        stdout = proc.stdout or b""
-        if len(stdout) > _MAX_PROBE_OUTPUT_BYTES:
-            return {"status": "invalid_media", "error": "ffprobe output too large"}
-        try:
-            payload = json.loads(stdout.decode("utf-8", errors="replace"))
-        except ValueError:
-            return {"status": "invalid_media", "error": "Unreadable ffprobe output"}
-        return parse_ffprobe_output(payload)
-
-    @staticmethod
-    def _clean_stderr(stderr: Any, path: Path, root: Path) -> str:
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode("utf-8", errors="replace")
-        text = str(stderr or "").strip()
-        # Keep absolute paths out of model-facing output.
-        text = text.replace(f"file:{path}", path.name)
-        text = text.replace(str(root), "<workspace>")
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        message = lines[-1] if lines else "ffprobe could not read this file"
-        return message[:_MAX_ERROR_CHARS]
+        return probe_media(ffprobe, path, root, timeout, self._runner)
 
     # -- entry point --------------------------------------------------------
 
@@ -890,4 +882,5 @@ __all__ = [
     "MediaWorkspaceSettings",
     "TOOL_NAME",
     "parse_ffprobe_output",
+    "probe_media",
 ]

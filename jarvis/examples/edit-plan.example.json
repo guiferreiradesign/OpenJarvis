@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "output_name": "skyline_reel",
+  "preset": "instagram_reel",
+  "fit": "crop",
+  "clips": [
+    {"source": "Skyline/keynote.mp4", "start": "00:00:05.0", "end": "00:00:12.5"},
+    {"source": "Skyline/crowd.mov", "start": 30, "end": 41.2}
+  ],
+  "video": {"frame_rate": 30, "crf": 20, "x264_preset": "medium"},
+  "audio": {"mode": "keep", "bitrate_kbps": 128},
+  "subtitles": {"source": "Skyline/captions.srt", "mode": "embed", "language": "eng"},
+  "branding": {
+    "asset": "logo.png",
+    "position": "top-right",
+    "width_fraction": 0.2,
+    "margin_px": 48,
+    "opacity": 0.9
+  },
+  "duration_tolerance_seconds": 0.25
+}

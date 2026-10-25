@@ -12,29 +12,78 @@ upstream parts to build on rather than rebuild.
 * Mac verification: see the checklist status below. Items 4–6 are deferred,
   not blocking.
 
-## Phase 2: deterministic local video pipeline
+## Phase 2: deterministic local video pipeline (done 2026-10-25; real footage not yet tried)
 
 Goal: "make a 45 s vertical cut from these clips" produces a versioned file
 without touching the sources. No LLM creativity yet: a fixed, testable
-pipeline.
+pipeline. Details: [video-pipeline.md](video-pipeline.md).
 
-* An `EditPlan` data model (JSON): source clip + in/out points, target aspect
-  ratio, captions, branding overlay, output preset. The LLM will later
-  *produce* plans; this phase *executes* them.
-* `media_render` tool: validates a plan against `media_workspace_inspect`
-  output, then runs FFmpeg with an argument list (no shell) into a separate,
-  configured **output** folder (`[jarvis.media_workspace] output_root`). It
-  writes versioned names (`reel_v001.mp4`), never overwrites, and refuses to
-  write inside the source root.
-* `media_validate` tool: ffprobe the result (duration within tolerance,
-  1080×1920, codecs, audio present) and create a low-resolution preview and a
-  thumbnail.
-* Captions: local Whisper (`speech/faster_whisper.py` already exists) → SRT →
-  burn-in. Branding: overlay a PNG from a configured assets folder.
-* Reuse: `ToolExecutor` timeouts/capabilities, the `speech/` STT backends, and
-  the Phase 1 path-safety code (extract a shared `jarvis_ext/_workspace.py`).
-* Capability: `file:write` (output folder only); `requires_confirmation` for
-  renders above a size or time threshold.
+Delivered:
+
+* `EditPlan` (JSON, strictly validated): clips with in/out points in list
+  order, preset (`instagram_reel`, 1080×1920 9:16 30 fps H.264/AAC), crop or
+  pad, frame rate and encoder settings, optional `.srt` subtitles and PNG
+  branding, duration tolerance.
+* `media_render`: checks sources with the Phase 1 path rules and ffprobe
+  (now shared via `jarvis_ext/_workspace.py` and `probe_media`). It renders
+  in a private temp dir and checks the file before publishing it as
+  `<name>_vNNN.mp4` plus a `.render.json` record in `[jarvis.media_render]
+  output_root`. That folder is separate from the workspace (checked by
+  inode); nothing is overwritten, and names are concurrency-safe.
+* `media_validate`: checksum against the record, ffprobe checks (including
+  per-stream durations), a full decode, then a 360×640 preview and a JPEG
+  thumbnail in `review/`. Only this tool can report `ready_for_review`.
+* Capabilities `file:read` + `file:write` (RBAC-tested); optional
+  `require_confirmation`.
+* 255 new tests, including real-FFmpeg integration on macOS.
+
+Changed from the original plan:
+
+* Output settings live in their own `[jarvis.media_render]` section (D10).
+* Captions: supplied SRT is embedded as a track by default. Burn-in works
+  only with an FFmpeg built with libass, which Homebrew's 9.0.2 is not.
+  Local Whisper transcription is an extension point
+  (`transcribe_to_srt`), not wired in: `faster-whisper` and a Whisper model
+  are not installed and need your approval (D16).
+* `requires_confirmation` is a single on/off setting, not a size/time
+  threshold. OpenJarvis' executor only supports per-tool confirmation;
+  per-job approvals belong with Phase 3 jobs.
+
+### Mac verification checklist (Phase 2)
+
+Done in this session (macOS 26.5.1 arm64, Python 3.13.17, FFmpeg 9.0.2):
+
+* `uv run pytest tests/jarvis_ext`: 372 passed, 0 skipped.
+* Wider suite (`uv run pytest tests/ -n auto -m "not live and not cloud and
+  not hub"`, dev extras only): 9225 passed, 270 skipped, 9 failed, 5
+  collection errors. The same 9 failures and 5 errors occur on the
+  untouched Phase 1 commit `2ad2519c`. Eight failures and all 5 errors come
+  from `fastapi` not being installed (server extras), and
+  `test_convert_mlx_quantize` fails under `-n auto` only.
+  `tests/tools/test_tool_timeout.py::test_repeated_timeouts_use_bounded_workers`
+  failed in one of two full runs and passes alone and after the JARVIS
+  tests. It is timing-sensitive under full parallel load.
+* End-to-end CLI render + validate of generated test media (landscape +
+  portrait clips, a file name with spaces, quotes, commas and brackets,
+  a translucent PNG logo, embedded SRT). Frames were inspected visually
+  (crop, logo position) and the subtitle track was extracted and checked
+  for sanitised text.
+
+Still for you to do (needs real footage, which tests must not use):
+
+1. Create the output folder and config (see video-pipeline.md), copy two
+   or three clips (one iPhone portrait clip) into a test workspace, and
+   write a small plan with `media-inspect` durations.
+2. `uv run python -m jarvis_ext media-render plan.json --validate`, then
+   open the preview, thumbnail and full file in QuickTime. Check framing,
+   cuts at the requested times, audio sync across clips, and the logo.
+3. Check how the iPhone HDR (Dolby Vision, 10-bit) clip looks: no tone
+   mapping is applied (see video-pipeline.md, limitations).
+4. Upload one render to Instagram as a private/draft Reel to confirm the
+   format is accepted (manual; JARVIS does not post anything).
+5. Decide whether you want burned-in captions (needs an FFmpeg with
+   libass) and/or local Whisper (`uv sync --extra speech` plus a one-off
+   model download of about 75–145 MB).
 
 ## Phase 3: jobs, status, notifications, revisions
 

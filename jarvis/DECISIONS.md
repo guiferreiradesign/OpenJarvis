@@ -1,6 +1,6 @@
 # Architecture decisions
 
-Short records of decisions made during Phase 1, so they can be revisited
+Short records of decisions made during Phases 1 and 2, so they can be revisited
 deliberately rather than by accident.
 
 ## D1. Custom code goes in a separate `jarvis_ext` package
@@ -67,6 +67,89 @@ playlists disguised as `.mp4`.
 
 FFmpeg is an optional system tool. Without it, the tool lists files and adds
 a warning. No Python packages were added.
+
+## D9. Phase 2 reuses Phase 1 path safety and ffprobe through shared functions
+
+**Decision:** the resolver moved from a method of `MediaWorkspaceInspectTool`
+to `jarvis_ext/_workspace.py` (`resolve_relative`, `same_or_inside`), and
+the hardened ffprobe call became the module function
+`media_workspace.probe_media`. The inspect tool delegates to both; its
+behaviour and tests are unchanged.
+
+**Why:** one implementation of "is this path allowed" and "probe this file
+safely", as the roadmap planned. `parse_ffprobe_output` also gained
+per-stream `duration_seconds` (an additive field), which validation needs
+(see D14).
+
+## D10. Output settings get their own `[jarvis.media_render]` section
+
+**Decision:** `output_root` lives in `[jarvis.media_render]`, not in
+`[jarvis.media_workspace]` as the roadmap sketched.
+
+**Why:** the workspace section is a read-only allow-list with strict
+unknown-key validation. Keeping write settings in a separate section keeps
+"what may be read" and "where may be written" separately reviewable, and
+leaves Phase 1 configs valid unchanged.
+
+## D11. The output folder must exist and be disjoint from the workspace, by inode
+
+**Why:** auto-creating `output_root` would create a stray folder under
+`/Volumes` when an external drive is unplugged. String comparisons are
+fooled by APFS case-insensitivity and symlinked aliases, so overlap is
+checked with `(st_dev, st_ino)` on every call, not just at config load.
+
+## D12. Render in a private temp dir, check, then publish atomically
+
+**Decision:** FFmpeg writes `render.mp4` (fixed name, `-n`) in
+`<output>/.jarvis-tmp/job-*`. The file is probed and checked there, then
+published with `link(2)` (fails on an existing name). There is an
+`O_EXCL`-reservation fallback for filesystems without hard links. The next
+version is "highest existing + 1"; a name taken in a race is skipped.
+
+**Why:** no partially written or wrong file ever carries a final name; no
+overwrite is possible even under concurrency; the temp dir is on the same
+filesystem, so publishing is a metadata operation. Considered alternatives:
+reserving a version before rendering (leaves empty placeholders on failure),
+or `rename(2)` (silently overwrites on macOS).
+
+## D13. Render success and validation are separate tools and statuses
+
+**Decision:** `media_render` always returns `ready_for_review: false`, and
+only `media_validate` can return `true`. Validation needs the
+`.render.json` record and compares the file's SHA-256 with it.
+
+**Why:** the brief requires that a failed validation never looks like a
+ready video. The checksum ties validation to the exact bytes the render
+produced, and detects truncation or replacement. The full decode pass is
+in validation (not render) to keep renders fast; render still runs the
+cheap probe-based checks before publishing.
+
+## D14. Durations are checked per stream, not only per container
+
+**Why:** found while testing. A truncated source with its index at the start
+probes as 3.5 s, but only 1.3 s of video decodes. Audio is padded to keep
+A/V sync, so the container still reported 3.5 s and the bad render passed
+every check. Checking `video_duration` and `audio_duration` separately
+catches it (regression test: `test_truncated_source_is_never_published`).
+
+## D15. Clip order is list order; the plan carries no separate order field
+
+**Why:** a second ordering field could disagree with the list, and an
+ambiguous plan is worse than none. Reordering means reordering the list.
+
+## D16. Subtitles are embedded by default; burn-in is optional and detected
+
+**Why:** Homebrew FFmpeg 9.0.2 has no libass, so the `subtitles` filter
+does not exist on this Mac. The tool asks FFmpeg which encoders and filters
+it has, and refuses a plan it cannot render instead of failing midway.
+Supplied SRT is re-parsed and rewritten (never passed through), so styling
+codes and paths never reach the filter graph. Automatic transcription stays
+an extension point until a local Whisper model is approved.
+
+## D17. Never copy source metadata into renders
+
+`-map_metadata -1 -map_chapters -1` on every output. iPhone clips carry GPS
+location and device data, and renders are meant to be shared.
 
 ## Assumptions
 

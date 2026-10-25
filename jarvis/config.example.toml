@@ -15,6 +15,34 @@ root = "~/Movies/JARVIS"
 # ffprobe_timeout_seconds = 15
 # probe_budget_seconds = 60
 
-# Let agents use the tool by default.
+[jarvis.media_render]
+# Required for media_render / media_validate. An EXISTING folder outside the
+# media workspace (they may not contain each other). The only place these
+# tools write.
+output_root = "~/Movies/JARVIS-Renders"
+
+# Optional: folder holding branding PNGs referenced by plans.
+# assets_root = "~/Movies/JARVIS-Assets"
+
+# Optional settings (defaults shown).
+# ffmpeg_path = ""                   # e.g. "/opt/homebrew/bin/ffmpeg"
+# ffprobe_path = ""                  # default: media_workspace.ffprobe_path
+# default_preset = "instagram_reel"  # 1080x1920, 9:16, 30 fps, H.264/AAC
+# require_confirmation = false       # true: ask before every render
+# render_timeout_seconds = 900
+# validate_timeout_seconds = 300
+# max_clips = 20
+# max_output_seconds = 600
+# duration_tolerance_seconds = 0.25
+# preview_height = 640
+
+# Optional extra presets:
+# [jarvis.media_render.presets.square_post]
+# width = 1080
+# height = 1080
+# frame_rate = 30
+# max_duration_seconds = 60
+
+# Let agents use the tools by default.
 [tools]
-enabled = "media_workspace_inspect,think"
+enabled = "media_workspace_inspect,media_render,media_validate,think"

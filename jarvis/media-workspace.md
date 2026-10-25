@@ -112,6 +112,8 @@ result = MediaWorkspaceInspectTool().execute(subpath="Skyline", media_type="vide
 }
 ```
 
+Since Phase 2 the `video` and `audio` objects also carry their own
+`duration_seconds` (a stream can be shorter than the container).
 `metadata.status` is one of `ok`, `invalid_media`, `timeout`, `probe_failed`,
 `unreadable`, `skipped` (the file changed during inspection) or
 `skipped_time_budget`. `orientation` takes the rotation flag that phones write
@@ -163,8 +165,9 @@ into account. One bad file never fails the whole call.
 * **Network/cloud-synced folders** (iCloud Drive, Dropbox "online-only"):
   ffprobe may trigger a download or time out. Those files are reported as
   `timeout`, but probing can still be slow.
-* **No content analysis.** No scene detection, transcription, thumbnails or
-  "strongest moments" yet. That is Phase 2.
+* **No content analysis.** No scene detection, transcription or "strongest
+  moments" yet (Phase 8). Rendering, previews and thumbnails from an
+  explicit plan arrived in Phase 2 ([video-pipeline.md](video-pipeline.md)).
 * Directory walk order is depth-first, with files listed before sub-folders.
   `max_files` truncates in that order.
 
