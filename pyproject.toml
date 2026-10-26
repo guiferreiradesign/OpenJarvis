@@ -116,6 +116,12 @@ voice = [
     "sounddevice>=0.5",  # play_wav / record_until_silence in speech/voice_io.py
     "numpy>=1.24",
 ]
+# JARVIS speech input: MLX Whisper (jarvis/speech.md). Apple Silicon only.
+# Exact pin: 0.4.3 is the benchmarked version. mlx itself is left to the
+# resolver so it stays compatible with inference-mlx (mlx-lm needs >=0.31.2).
+speech-mlx = [
+    "mlx-whisper==0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 openhands = ["openhands-sdk>=1.0; python_version >= '3.12'"]
 # Apple Foundation Models (on-device AFM 3). Needs an Apple Silicon Mac on
 # macOS 26+ with Apple Intelligence enabled. The SDK compiles Swift bindings

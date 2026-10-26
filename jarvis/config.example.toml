@@ -56,6 +56,24 @@ output_root = "~/Movies/JARVIS-Renders"
 # notifications = "log"              # finished jobs: "log", or "macos" for a
 #                                    # Notification Center banner as well
 
+[jarvis.speech_input]
+# Optional (Phase 4.1). MLX Whisper on Apple Silicon; see jarvis/speech.md.
+# model = "mlx-community/whisper-base-mlx"   # do not use large-v3-turbo on 8 GB
+# language = "en"                            # "" = auto-detect
+# initial_prompt = "JARVIS, Voicebox, Kokoro, George, Phase 4.1 roadmap"
+# max_audio_seconds = 120
+
+[jarvis.speech_output]
+# Optional (Phase 4.1). The local Voicebox app; loopback URLs only.
+# base_url = "http://127.0.0.1:17493"
+# profile = ""                 # id or name; "" = first kokoro/bm_george profile
+# engine = "kokoro"
+# voice = "bm_george"
+# language = "en"
+# timeout_seconds = 60
+# connect_timeout_seconds = 2
+# max_text_chars = 4000
+
 # Let agents use the tools by default.
 [tools]
 enabled = "media_workspace_inspect,media_render,media_validate,media_job_submit,media_job_status,media_job_revise,think"

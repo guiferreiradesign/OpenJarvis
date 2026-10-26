@@ -123,6 +123,39 @@ Out of scope for Phase 3: writing plans from a brief, the video-editing
 skill itself, HyperFrames captions/graphics, external notification
 channels, parallel jobs, per-clip caching.
 
+## Phase 4.1: speech providers (done 2026-10-26; foundation only)
+
+Goal: replaceable speech input and output for the coming interface,
+without touching the agent or Phase 3. Details: [speech.md](speech.md);
+decisions D34–D37.
+
+Delivered:
+
+* Speech input: `MlxWhisperBackend` (upstream `SpeechBackend`, registry key
+  `mlx-whisper`), `mlx-community/whisper-base-mlx`, English, vocabulary
+  prompt `JARVIS, Voicebox, Kokoro, George, Phase 4.1 roadmap`, raw
+  transcript (no LLM clean-up). Lazy, explicit `load()`; the model stays
+  loaded; in-process WAV decoding; serialised inference; cold and warm
+  timings reported separately.
+* Speech output: `VoiceboxTTSBackend` (upstream `TTSBackend`, key
+  `voicebox`) for the local Voicebox service, Kokoro engine, George voice
+  (`JARVIS` profile), loopback URLs only, `personality` always off.
+* `[jarvis.speech_input]` / `[jarvis.speech_output]` settings;
+  `python -m jarvis_ext speech-check | speech-transcribe | speech-say`.
+* 125 mocked tests (no model, MLX, microphone or Voicebox needed). Text-only
+  JARVIS imports no speech code.
+* Measured on this Mac (Python 3.13, mlx-whisper 0.4.3): model load
+  ≈ 2.5 s, first transcription ≈ 0.5 s, then ≈ 0.21 s for 16.8 s of
+  speech; Voicebox ≈ 2.4 s per sentence once warm.
+
+Not chosen: Whisper Large-v3-Turbo (memory pressure on 8 GB) and Voicebox's
+own transcription (≈ 3–4 s versus ≈ 0.2 s).
+
+Dependency (approved, D37): optional `speech-mlx` extra,
+`mlx-whisper==0.4.3` for Apple Silicon only, sharing the locked mlx
+0.31.2 with `inference-mlx`. Install with `uv sync --extra dev --extra
+speech-mlx`; the model weights download separately on first use.
+
 ## Next milestone: JARVIS First Usable Interface — Web, Text and Voice
 
 Not started. This is the first version meant for everyday use: talk to
@@ -164,11 +197,12 @@ their place.
   upstream and its telemetry (`posthog-js`) must be reviewed and turned
   off. Option B: a small separate web app in the JARVIS tree talking to
   the same API; cleaner ownership, more work. Decide after a short spike.
-* **Speech: interchangeable providers.** Upstream already has speech-to-
-  text (`faster_whisper`, `openai_whisper`, `deepgram`) and text-to-speech
-  (`kokoro_tts`, `openai_tts`, `elevenlabs_tts`, `cartesia_tts`) behind
-  common interfaces. Evaluate local processing first (faster-whisper,
-  Kokoro) for latency and quality on the Mac; paid providers only with
+* **Speech: interchangeable providers.** Chosen in Phase 4.1: MLX Whisper
+  Base for input and the local Voicebox (Kokoro, George) for output, both
+  behind upstream's `SpeechBackend` / `TTSBackend` interfaces (speech.md).
+  Still to do here: microphone capture and push-to-talk, playback, loading
+  the model once at start-up, selecting the providers in `jarvis serve`,
+  and the transcript → agent → spoken reply loop. Paid providers only with
   your approval (D21's no-paid-API rule still applies).
 * **Security:** the browser is just another client: authenticated,
   bound to localhost by default, and subject to the same per-tool
@@ -215,7 +249,9 @@ their place.
   Sending stays behind approval.
 * Personal memory: enable the existing fact store; seed preferences such as
   brand colours, caption style and reel length.
-* Voice: local Whisper + local TTS (Kokoro) first; paid TTS only if approved.
+* Voice: providers done in Phase 4.1 (MLX Whisper Base + Voicebox/Kokoro);
+  the voice interface comes with the First Usable Interface milestone.
+  Paid TTS only if approved.
 * Approvals: generalise the existing proactive-agent approval queue
   (`tools/approval_store.py`, `server/approval_routes.py`).
 

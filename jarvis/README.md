@@ -11,6 +11,7 @@ untouched.
 | [media-workspace.md](media-workspace.md) | The first JARVIS capability: read-only media-workspace inspection |
 | [video-pipeline.md](video-pipeline.md) | Phase 2: `EditPlan`, `media_render`, `media_validate`, output versioning and safety |
 | [jobs.md](jobs.md) | Phase 3: jobs, worker and CLI, progress, notifications, revisions and reuse, agent job tools |
+| [speech.md](speech.md) | Phase 4.1: speech input (MLX Whisper Base) and speech output (Voicebox) providers |
 | [examples/edit-plan.example.json](examples/edit-plan.example.json) | A complete example edit plan |
 | [DECISIONS.md](DECISIONS.md) | Architecture decisions and assumptions |
 | [ROADMAP.md](ROADMAP.md) | Phases 1–8, the next milestone (First Usable Interface) and the Mac checklist |
@@ -50,16 +51,23 @@ src/jarvis_ext/            # JARVIS extension package (custom code only)
         subtitles.py       #     SRT parsing/sanitising, transcription hook
         checks.py          #     output-vs-plan checks
         render_job.py      #     video.render job handler (uses the tools)
+    speech/                #   speech providers (Phase 4.1), not tools
+        mlx_whisper.py     #     speech-to-text: MLX Whisper (SpeechBackend)
+        voicebox.py        #     text-to-speech: local Voicebox (TTSBackend)
+        audio.py           #     in-process WAV decoding to 16 kHz mono
+        settings.py        #     [jarvis.speech_input] / [jarvis.speech_output]
+        errors.py          #     SpeechError and subclasses
 tests/jarvis_ext/          # tests for the extension package
 jarvis/                    # this documentation
 ```
 
-The fork touches upstream files in exactly two places:
+The fork touches upstream files in these places:
 
 | File | Change |
 |---|---|
 | `src/openjarvis/tools/__init__.py` | One guarded `import jarvis_ext` at the end (the `try/except ImportError` pattern used for built-in tools). If the extension is present but broken it logs a warning; it never breaks the core |
-| `pyproject.toml` | `src/jarvis_ext` added to the wheel `packages` list |
+| `pyproject.toml` | `src/jarvis_ext` added to the wheel `packages` list; the optional `speech-mlx` extra (`mlx-whisper`, Apple Silicon only, see speech.md) |
+| `uv.lock` | Locks the `speech-mlx` extra (adds only `mlx-whisper`) |
 
 ## Architecture (current and planned)
 
@@ -103,7 +111,7 @@ The fork touches upstream files in exactly two places:
 | Scheduling / background jobs | **Available upstream** | `TaskScheduler` (cron/interval/once) + operators |
 | Memory / preferences | **Available upstream** | Fact store + retrieval backends |
 | Approvals | **Partial upstream** | Interactive confirmation + a proactive-agent approval queue with REST routes |
-| Voice | **Available upstream** | Whisper STT and several TTS backends (some paid) |
+| Voice | **Providers implemented** (JARVIS) | MLX Whisper Base (input) and local Voicebox/Kokoro (output) behind upstream's speech interfaces; no microphone or voice loop yet. See speech.md |
 | Email / notifications | **Available upstream** (channels) | Not configured; sending is out of scope for Phase 1 |
 | Video rendering from an explicit edit plan | **Implemented** (JARVIS) | `media_render` + `media_validate`, 1080×1920 Reels preset, versioned outputs, preview/thumbnail. Real-FFmpeg tested on macOS with generated media. See video-pipeline.md |
 | Autonomous editing ("strongest moments") | **Planned** | Phase 8 |

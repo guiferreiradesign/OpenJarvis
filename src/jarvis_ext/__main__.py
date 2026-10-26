@@ -11,6 +11,10 @@
     python -m jarvis_ext jobs show JOB_ID
     python -m jarvis_ext jobs cancel JOB_ID
     python -m jarvis_ext jobs worker [--once]
+    python -m jarvis_ext speech-check [--config PATH]
+    python -m jarvis_ext speech-transcribe AUDIO.wav [--repeat N] [--config PATH]
+    python -m jarvis_ext speech-say TEXT --out FILE.wav [--profile P]
+        [--config PATH]
 
 Prints the same JSON an agent receives.  Exit status is 0 on success, 1 when
 the tool reports an error (for example an unconfigured workspace or a failed
@@ -24,6 +28,13 @@ reusing an identical earlier job's output.  The worker
 logs progress to stderr and prints a report when it exits; Ctrl-C (or
 SIGTERM) lets the current job finish, a second one stops it now.  It sends
 a notification for each finished job (``[jarvis.jobs] notifications``).
+
+``speech-*`` commands use the speech providers directly (jarvis/speech.md).
+``speech-check`` reports whether MLX Whisper and Voicebox can be used,
+without loading a model.  ``speech-transcribe`` loads the model once, then
+transcribes the file ``--repeat`` times in the same process and reports the
+cold load separately from each warm run.  ``speech-say`` writes Voicebox's
+WAV to a new file (it never overwrites one).
 """
 
 from __future__ import annotations
@@ -211,6 +222,85 @@ def _worker(args: argparse.Namespace, settings: Any) -> int:
     return 0
 
 
+def _speech(args: argparse.Namespace) -> int:
+    """``speech-*`` commands.  Errors go to stderr without paths."""
+    from jarvis_ext.speech.errors import SpeechError
+    from jarvis_ext.speech.mlx_whisper import MlxWhisperBackend
+    from jarvis_ext.speech.voicebox import VoiceboxTTSBackend
+
+    try:
+        if args.command == "speech-check":
+            stt = MlxWhisperBackend(config_path=args.config)
+            tts = VoiceboxTTSBackend(config_path=args.config)
+            report: dict = {
+                "speech_input": {**stt.stats(), "error": stt.unavailable_reason()},
+                "speech_output": {
+                    "backend": tts.backend_id,
+                    "base_url": tts.settings.base_url,
+                    "running": tts.health(),
+                },
+            }
+            if report["speech_output"]["running"]:
+                try:
+                    profile = tts.resolve_profile()
+                    report["speech_output"]["profile"] = profile.get("name")
+                except SpeechError as exc:
+                    report["speech_output"]["error"] = str(exc)
+            _print_json(report)
+            return 0
+
+        if args.command == "speech-transcribe":
+            try:
+                audio = Path(args.audio).read_bytes()
+            except OSError as exc:
+                print(f"Cannot read audio: {exc.strerror or exc}", file=sys.stderr)
+                return 1
+            stt = MlxWhisperBackend(config_path=args.config)
+            cold = stt.load()
+            runs = []
+            text = ""
+            for _ in range(args.repeat):
+                result = stt.transcribe(audio, format="wav")
+                timing = stt.last_timing
+                assert timing is not None
+                runs.append(round(timing.inference_seconds, 4))
+                text = result.text
+            _print_json(
+                {
+                    "text": text,
+                    "audio_seconds": round(result.duration_seconds, 3),
+                    "cold_load_seconds": round(cold, 4),
+                    "warm_inference_seconds": runs,
+                    "stats": stt.stats(),
+                }
+            )
+            return 0
+
+        if args.out.exists():
+            print("Cannot write audio: File exists", file=sys.stderr)
+            return 1
+        tts = VoiceboxTTSBackend(config_path=args.config)
+        result = tts.synthesize(args.text, voice_id=args.profile or "")
+        try:
+            with open(args.out, "xb") as fh:
+                fh.write(result.audio)
+        except OSError as exc:
+            print(f"Cannot write audio: {exc.strerror or exc}", file=sys.stderr)
+            return 1
+        _print_json(
+            {
+                "file": Path(args.out).name,
+                "duration_seconds": round(result.duration_seconds, 3),
+                "sample_rate": result.sample_rate,
+                **result.metadata,
+            }
+        )
+        return 0
+    except (SpeechError, ExtensionConfigError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m jarvis_ext")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -274,10 +364,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     for sub in (submit, revise, listing, show, cancel, worker):
         sub.add_argument("--config", type=Path, help="config.toml to read")
 
+    check = commands.add_parser(
+        "speech-check", help="Check the speech providers (loads nothing)."
+    )
+    transcribe = commands.add_parser(
+        "speech-transcribe", help="Transcribe a WAV file with MLX Whisper."
+    )
+    transcribe.add_argument("audio", help="PCM WAV file")
+    transcribe.add_argument(
+        "--repeat", type=_repeat, default=1, help="Warm runs after loading (1-20)"
+    )
+    say = commands.add_parser("speech-say", help="Speak text with Voicebox.")
+    say.add_argument("text")
+    say.add_argument("--out", type=Path, required=True, help="New WAV file")
+    say.add_argument("--profile", help="Voicebox profile id or name")
+    for sub in (check, transcribe, say):
+        sub.add_argument("--config", type=Path, help="config.toml to read")
+
     args = parser.parse_args(argv)
 
     if args.command == "jobs":
         return _jobs(args)
+
+    if args.command.startswith("speech-"):
+        return _speech(args)
 
     if args.command == "media-render":
         try:
@@ -323,6 +433,13 @@ def _limit(text: str) -> int:
     value = int(text)
     if not 1 <= value <= 1000:
         raise argparse.ArgumentTypeError("must be between 1 and 1000")
+    return value
+
+
+def _repeat(text: str) -> int:
+    value = int(text)
+    if not 1 <= value <= 20:
+        raise argparse.ArgumentTypeError("must be between 1 and 20")
     return value
 
 

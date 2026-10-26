@@ -1,6 +1,6 @@
 # Architecture decisions
 
-Short records of decisions made during Phases 1–3, so they can be revisited
+Short records of decisions made during Phases 1–4.1, so they can be revisited
 deliberately rather than by accident.
 
 ## D1. Custom code goes in a separate `jarvis_ext` package
@@ -501,6 +501,76 @@ worker does the work. Plans are also checked for unsafe paths (absolute,
 restricted agent obtain a render indirectly. `schedule:create` is the
 existing capability for deferred work. Status exposes only job metadata
 and output-folder file names, never plans or paths.
+
+## D34. Speech providers implement the upstream interfaces, outside the agent
+
+**Decision:** speech input is `jarvis_ext.speech.MlxWhisperBackend`
+(upstream `SpeechBackend`), speech output is `VoiceboxTTSBackend`
+(upstream `TTSBackend`). They are registered as `mlx-whisper` and
+`voicebox` in the existing `SpeechRegistry` / `TTSRegistry` from
+`jarvis_ext.ensure_registered()`, as **lazy factories**: the provider
+module is imported only when a backend is created. They are not tools,
+get no capabilities, and are not added to upstream's `auto` discovery
+order. No upstream file was changed.
+
+**Why:** upstream already has exactly these two interfaces and callers
+(`jarvis serve`, voice chat, the `text_to_speech` tool) that use them, so a
+new framework would only duplicate them. Registering the classes directly
+made every `openjarvis.tools` import about 0.5 s slower, because it pulls
+in upstream `openjarvis.speech` and its optional backends; the factories
+cost well under a millisecond. Keeping them out of `auto` means nothing
+changes until you choose them.
+
+## D35. MLX Whisper Base, loaded once, fed decoded audio, no transcript clean-up
+
+**Decision:** `mlx-community/whisper-base-mlx`, English, with the
+vocabulary prompt `JARVIS, Voicebox, Kokoro, George, Phase 4.1 roadmap`;
+the raw transcript is returned. The model is loaded lazily or by `load()`
+through `mlx_whisper`'s own process-wide `ModelHolder` (float16, as its
+`transcribe` uses) and kept for the life of the process. WAV is decoded in
+process and passed as a float32 array; inference holds a lock.
+
+**Why:** the benchmark chose Base (Turbo caused memory pressure on 8 GB;
+Voicebox's transcription took 3–4 s against about 0.3 s). Loading through
+the same holder is what makes the first request not load twice and later
+ones not at all. Passing a file path would make `mlx_whisper` start
+`ffmpeg` for every utterance. One MLX model should not run concurrent
+requests. Clean-up by an LLM would add latency and a second model that
+interprets what you said; it can be an option later.
+
+## D36. Voicebox: loopback only, stream endpoint, never its personality rewrite
+
+**Decision:** `base_url` must be plain `http://` to `localhost` or a
+loopback address with a port. Speech is generated with
+`POST /generate/stream` (WAV back, nothing saved in Voicebox's history),
+always with `personality: false`. The voice is chosen by profile id/name,
+or by default as the first profile using Kokoro `bm_george` (the `JARVIS`
+profile here). Proxy variables are ignored and redirects not followed.
+JARVIS never starts, stops or reconfigures Voicebox.
+
+**Why:** the brief is local speech with no external network access.
+`personality: true` would let Voicebox's own model reword JARVIS's replies.
+Choosing by preset voice rather than a profile UUID survives recreating the
+profile and matches upstream's `speech.voice_id = "bm_george"`.
+
+## D37. mlx-whisper is an optional `speech-mlx` extra; mlx is not pinned (approved)
+
+**Decision:** `speech-mlx = ["mlx-whisper==0.4.3; sys_platform == 'darwin'
+and platform_machine == 'arm64'"]` in `pyproject.toml`. It is not a
+default dependency. `mlx` is left to the resolver, which keeps the 0.31.2
+already locked for `inference-mlx`. The lock was regenerated with uv
+0.13.1, so the diff adds only `mlx-whisper` and the extra; no other
+package changed version.
+
+**Why:** the benchmark environment (Python 3.9.6, mlx 0.29.3) cannot be
+reproduced in the project: Python must be 3.10–3.13, and `mlx-lm` needs
+`mlx>=0.31.2`, which uv locks together with every other extra. Pinning
+0.29.3 would have needed a `[tool.uv] conflicts` entry and two MLX
+versions in the lock. With 0.31.2 the transcript and timings matched the
+benchmark version (measured on Python 3.13 and 3.10). `mlx-whisper` is
+pinned exactly because 0.4.3 is the version that was benchmarked. Newer uv
+releases (0.13.2+) rewrite three `onnxruntime` markers into an equivalent
+form; regenerating with 0.13.1 avoids mixing that churn into this change.
 
 ## Assumptions
 
