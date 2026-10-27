@@ -21,6 +21,10 @@ import type {
   ToolCallInfo,
 } from '../../types';
 
+// Home hands an in-flight request to Chat on navigation. Keep cancellation
+// available to the newly mounted composer during that route transition.
+let activeChatAbortController: AbortController | null = null;
+
 // While Deep Research is toggled on, poll connected sources for sync
 // progress so we can surface "Searching over N items — sync in progress"
 // next to the toggle. Polling is gated on `enabled` so toggling DR off
@@ -79,7 +83,17 @@ function useResearchCorpusSync(enabled: boolean): {
   return state;
 }
 
-export function InputArea() {
+export function InputArea({
+  onMessageStart,
+  showMic = true,
+  showResearch = true,
+  placeholder = 'Message OpenJarvis...',
+}: {
+  onMessageStart?: () => void;
+  showMic?: boolean;
+  showResearch?: boolean;
+  placeholder?: string;
+}) {
   const [input, setInput] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -101,7 +115,6 @@ export function InputArea() {
   const deepResearch = useAppStore((s) => s.deepResearch);
   const setDeepResearch = useAppStore((s) => s.setDeepResearch);
   const corpusSync = useResearchCorpusSync(deepResearch);
-  const isCurrentChatStreaming = streamState.isStreaming && streamState.conversationId === activeId;
 
   const {
     state: speechState,
@@ -163,7 +176,7 @@ export function InputArea() {
   }, [input]);
 
   const stopStreaming = useCallback(() => {
-    abortRef.current?.abort();
+    (abortRef.current ?? activeChatAbortController)?.abort();
     if (timerRef.current) {
       clearInterval(timerRef.current);
       timerRef.current = null;
@@ -219,6 +232,12 @@ export function InputArea() {
 
     const controller = new AbortController();
     abortRef.current = controller;
+    activeChatAbortController = controller;
+    let timedOut = false;
+    const timeout = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 180_000);
 
     let accumulatedContent = '';
     let usage: TokenUsage | undefined;
@@ -240,6 +259,7 @@ export function InputArea() {
       activeToolCalls: [],
       content: '',
     });
+    onMessageStart?.();
     useAppStore.getState().addLogEntry({
       timestamp: Date.now(),
       level: 'info',
@@ -456,7 +476,11 @@ export function InputArea() {
     } catch (err: any) {
       if (err.name === 'AbortError') {
         // User cancelled or model switch — keep whatever was accumulated
-        if (!accumulatedContent) accumulatedContent = '(Generation stopped)';
+        if (!accumulatedContent) {
+          accumulatedContent = timedOut
+            ? 'This request timed out after 3 minutes. Please try again.'
+            : '(Generation stopped)';
+        }
       } else {
         const errMsg = err?.message || String(err);
         accumulatedContent =
@@ -470,6 +494,7 @@ export function InputArea() {
       // numbers don't get stuck on the last sample.
       useAppStore.getState().setLiveEnergy(null);
     } finally {
+      window.clearTimeout(timeout);
       if (!accumulatedContent) {
         accumulatedContent = 'No response was generated. Please try again.';
       }
@@ -528,6 +553,7 @@ export function InputArea() {
         message: `Response: ${accumulatedContent.length} chars`,
       });
       abortRef.current = null;
+      if (activeChatAbortController === controller) activeChatAbortController = null;
 
       // Research path updates session counters optimistically from the
       // `done` event's usage payload — re-fetching here would overwrite
@@ -552,6 +578,7 @@ export function InputArea() {
     deepResearch,
     temperature,
     maxTokens,
+    onMessageStart,
   ]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -563,7 +590,7 @@ export function InputArea() {
 
   return (
     <div className="px-4 pb-4 pt-2" style={{ maxWidth: 'var(--chat-max-width)', margin: '0 auto', width: '100%' }}>
-      <div className="mb-2 flex flex-col gap-1">
+      {showResearch && <div className="mb-2 flex flex-col gap-1">
         <div className="flex items-center gap-2">
           <button
             type="button"
@@ -594,7 +621,7 @@ export function InputArea() {
             items — sync in progress, results will improve as more data is indexed.
           </div>
         )}
-      </div>
+      </div>}
       <div
         className="flex items-center gap-2 rounded-2xl px-4 py-3 transition-shadow"
         style={{
@@ -608,29 +635,29 @@ export function InputArea() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={selectedModel ? 'Message OpenJarvis...' : 'Pick a model first (⌘K)...'}
+          placeholder={selectedModel ? placeholder : 'Pick a model first (⌘K)...'}
           rows={1}
           className="flex-1 bg-transparent outline-none resize-none text-sm leading-relaxed"
           style={{ color: 'var(--color-text)', maxHeight: '200px' }}
           disabled={streamState.isStreaming || modelLoading}
         />
-        {isCurrentChatStreaming ? (
+        {streamState.isStreaming ? (
           <button
             onClick={stopStreaming}
             className="p-2 rounded-xl transition-colors shrink-0 cursor-pointer"
             style={{ background: 'var(--color-error)', color: 'var(--color-on-accent)' }}
-            title="Stop generating"
+            title="Stop the active JARVIS response"
           >
             <Square size={16} />
           </button>
         ) : (
           <div className="flex items-center gap-1">
-            <MicButton
+            {showMic && <MicButton
               state={speechState}
               onClick={handleMicClick}
               disabled={micDisabled}
               reason={micReason}
-            />
+            />}
             <button
               onClick={sendMessage}
               disabled={streamState.isStreaming || !input.trim() || modelLoading || !selectedModel}

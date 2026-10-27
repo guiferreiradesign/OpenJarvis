@@ -32,6 +32,24 @@ async function freshStore() {
 }
 
 describe('conversation stream ownership', () => {
+  it('starts a new conversation with no messages from the previous one', async () => {
+    const store = await freshStore();
+    const firstId = store.getState().createConversation('test-model');
+    store.getState().addMessage(firstId, {
+      id: 'prior-turn',
+      role: 'user',
+      content: 'Previous conversation only',
+      timestamp: 1,
+    });
+
+    const secondId = store.getState().createConversation('test-model');
+
+    expect(secondId).not.toBe(firstId);
+    expect(store.getState().activeId).toBe(secondId);
+    expect(store.getState().messages).toEqual([]);
+    expect(store.getState().conversations.find((item) => item.id === firstId)?.messages).toHaveLength(1);
+  });
+
   it('persists background stream updates without replacing the active messages', async () => {
     const store = await freshStore();
     const sourceId = store.getState().createConversation('test-model');

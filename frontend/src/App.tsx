@@ -2,6 +2,8 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { Routes, Route } from 'react-router';
 import { Layout } from './components/Layout';
 import { ChatPage } from './pages/ChatPage';
+import { DashboardHome } from './components/Jarvis/DashboardHome';
+import { PlaceholderPage } from './components/Jarvis/PlaceholderPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { GetStartedPage } from './pages/GetStartedPage';
@@ -184,7 +186,10 @@ export default function App() {
       <UpdateChecker />
       <Routes>
         <Route element={<Layout />}>
-          <Route index element={<ChatPage />} />
+          <Route index element={<DashboardHome />} />
+          <Route path="chat" element={<ChatPage />} />
+          <Route path="projects" element={<PlaceholderPage title="Projects" />} />
+          <Route path="tools" element={<PlaceholderPage title="Tools" />} />
           <Route path="dashboard" element={<DashboardPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="get-started" element={<GetStartedPage />} />
