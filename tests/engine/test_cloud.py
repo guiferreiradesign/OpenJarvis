@@ -725,10 +725,63 @@ class TestOpenRouterToolForwarding:
         assert sent["tools"] == tools
         assert sent["tool_choice"] == "auto"
 
-        # tool_calls from the response are parsed back into the result
+        # Provider wire format is normalized to the flat agent contract.
         assert result["tool_calls"][0]["id"] == "call_1"
-        assert result["tool_calls"][0]["function"]["name"] == "get_weather"
-        assert result["tool_calls"][0]["function"]["arguments"] == '{"city": "NYC"}'
+        assert result["tool_calls"][0]["name"] == "get_weather"
+        assert result["tool_calls"][0]["arguments"] == '{"city": "NYC"}'
+
+    def test_openrouter_tool_call_executes_in_orchestrator(self) -> None:
+        from openjarvis.agents.orchestrator import OrchestratorAgent
+        from openjarvis.tools.calculator import CalculatorTool
+
+        def response(content: str, tool_calls: list | None = None):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=content, tool_calls=tool_calls
+                        ),
+                        finish_reason="tool_calls" if tool_calls else "stop",
+                    )
+                ],
+                usage=SimpleNamespace(
+                    prompt_tokens=3, completion_tokens=2, total_tokens=5
+                ),
+                model="provider/free-model",
+            )
+
+        tool_call = SimpleNamespace(
+            id="call_calc",
+            type="function",
+            function=SimpleNamespace(
+                name="calculator", arguments='{"expression":"6 * 7"}'
+            ),
+        )
+        fake_client = mock.MagicMock()
+        fake_client.chat.completions.create.side_effect = [
+            response("", [tool_call]),
+            response("The result is 42."),
+        ]
+        engine = CloudEngine.__new__(CloudEngine)
+        engine._openrouter_client = fake_client
+        agent = OrchestratorAgent(
+            engine, "openrouter/provider/free-model", tools=[CalculatorTool()]
+        )
+
+        result = agent.run("What is 6 times 7?")
+
+        assert result.content == "The result is 42."
+        assert len(result.tool_results) == 1
+        assert result.tool_results[0].tool_name == "calculator"
+        assert result.tool_results[0].content == "42"
+        assert result.tool_results[0].success is True
+        second_request = fake_client.chat.completions.create.call_args_list[1].kwargs
+        assistant_tool_call = second_request["messages"][-2]["tool_calls"][0]
+        assert assistant_tool_call["function"]["name"] == "calculator"
+        assert (
+            assistant_tool_call["function"]["arguments"]
+            == '{"expression":"6 * 7"}'
+        )
 
 
 class TestCloudEngineCanServe:
