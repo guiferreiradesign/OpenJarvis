@@ -572,6 +572,87 @@ pinned exactly because 0.4.3 is the version that was benchmarked. Newer uv
 releases (0.13.2+) rewrite three `onnxruntime` markers into an equivalent
 form; regenerating with 0.13.1 avoids mixing that churn into this change.
 
+## D38. Preflight: one registry of real checks, honest statuses, extend before adding
+
+**Decision:** `python -m jarvis_ext preflight` is the standard verification
+step. Checks register with a decorator and run in groups (app, media, jobs,
+brain, future). Statuses are PASS, FAIL and WARN. A check that could not run
+is WARN with "NOT RUN" and no timing, never PASS. An optional component that
+is absent is WARN; an existing component that is broken, or a required one
+that is missing, is FAIL and the exit status is 1. Every check has a latency
+budget and a slow pass becomes WARN. Media and job checks use a generated
+fixture and an isolated temp database. Secret checks plant canary keys and
+scan for them and for the real configured values; findings never print a
+value. The brain checks never change configuration; the request check
+intercepts HTTP and blocks non-loopback sockets, so it proves request shape
+only; the one live request is behind `--live-brain`. Starting the real
+`jarvis serve` is behind `--spawn-server`. No new dependency.
+Rule: a change to critical functionality is not reported complete until the
+relevant tests and preflight checks have been run and reported; a subset is
+never described as end-to-end verification.
+
+**Why:** earlier verification was a set of unit suites plus manual Mac
+runs, with no single command that exercised the real pipeline, job store,
+secret handling and provider selection together. Statuses are strict so a
+green run cannot hide a skipped or unimplemented part.
+
+**Revisit if:** the checks become slow enough to discourage running them, or
+a group needs a service that cannot be faked.
+
+## D39. Voice output goes through a JARVIS adapter; no silent cloud fallback; confirm which "VoiceStudio"
+
+**Decision (proposed, not yet implemented):** build a `jarvis_ext/voice/`
+layer (adapter interface, profiles, cache, chunker, playback contract) in
+front of the existing Voicebox backend first, then add a VoiceStudio adapter
+once it is identified. Speech output never falls back to a cloud provider on
+its own. Finding that motivates this: upstream's `_tts_discovery` tries
+`kokoro`, `openai_tts`, `cartesia`, `elevenlabs` in that order and treats a
+backend as usable when its health check passes, which for the cloud ones
+depends only on their API key existing. With a key configured and the local
+service down, `/v1/speech/synthesize` would send reply text to that provider.
+`future.speech_cloud_fallback` flags that situation (WARN) today.
+
+"VoiceStudio" is ambiguous: the repository contains the Voicebox integration,
+and more than one unrelated public project uses the name VoiceStudio. No
+integration contract is assumed until the user says which one is meant.
+
+**Why:** the user's rule is local speech generation and no permanent cloud
+audio service; the upstream default order breaks it quietly.
+
+**Revisit if:** the user wants an optional, explicitly enabled cloud voice.
+
+## D40. JARVIS speaks with Kokoro "George" through VoiceStudio, chosen explicitly on every request
+
+**Decision (implemented 2026-10-29):** JARVIS's default voice is Kokoro 82M
+(`bm_george`, British English) served by the local VoiceStudio v0.5.7 at
+`http://127.0.0.1:3900` through MLX-Audio. `VoiceStudioTTSBackend`
+(`TTSRegistry["voicestudio"]`) is the target backend and
+`speech.tts_backend` defaults to it; Voicebox is no longer the target (its
+code stays registered, unused). Every request to `POST /v1/audio/speech`
+carries `model: "mlx-audio"`, `voice: "bm_george"`, `language: "British
+English"` and `response_format: "wav"` explicitly. Model, voice, language,
+speed and URL are configurable in `[jarvis.voicestudio]`; the URL must be
+loopback. The sample rate is read from the WAV header, never assumed.
+
+The spoken copy of the text writes the name as the word "Jarvis" (Kokoro
+spelled `J.A.R.V.I.S.` letter by letter); displayed text is unchanged.
+
+**Why:** VoiceStudio's "active engine" can change in its UI (and the
+`tts-1` aliases follow it), so relying on it could change JARVIS's voice or
+select a model with a licence JARVIS must not use. Listening comparison:
+KittenTTS worked but sounded too robotic; George beat Daniel. OmniVoice is
+non-commercial and its licence was not accepted; JARVIS never requests it.
+No cloud TTS fallback: when VoiceStudio is down, speech fails with a clear
+error and everything else keeps working (builds on D39).
+
+**Not decided / still open:** profiles, caching, chunking, streaming and
+cancellation of an in-flight request (the server's worker thread has no
+cancel hook); a by-ear check that "Jarvis" is pronounced as the full name
+(only durations were compared).
+
+**Revisit if:** the voice changes, VoiceStudio gains a stable headless start
+command, or a different local engine beats Kokoro on this 8 GB Mac.
+
 ## Assumptions
 
 * Only you (and processes you trust) write to the media workspace. See the

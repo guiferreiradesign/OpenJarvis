@@ -580,7 +580,7 @@ function GmailOAuthAdvanced({
         >
           <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginBottom: 8 }}>
             For developers with an existing Google Cloud project. Enable the
-            Gmail API and create a Desktop OAuth client at{' '}
+            Gmail API and create a Web application OAuth client at{' '}
             <a
               href="https://console.cloud.google.com/apis/credentials"
               target="_blank"
@@ -589,7 +589,15 @@ function GmailOAuthAdvanced({
             >
               Google Cloud Credentials →
             </a>{' '}
-            then paste the Client ID and Client Secret below.
+            then add this backend callback as an authorized redirect URI (for a
+            local server,{' '}
+            <code>
+              http://127.0.0.1:8000/v1/connectors/gmail/oauth/callback
+            </code>
+            ). Paste the Client ID and Client Secret below to open Google's
+            consent flow. The dashboard orchestrator exposes draft creation,
+            not a Gmail send tool; Google's <code>gmail.compose</code> OAuth
+            permission also allows sending at API level.
           </div>
           <InlineConnectForm
             fields={[

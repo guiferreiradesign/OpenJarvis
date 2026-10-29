@@ -52,6 +52,11 @@ class TestSpeechInputSettings:
         assert settings.initial_prompt == "Lisboa, JARVIS"
         assert settings.max_audio_seconds == 30.0
 
+    def test_microphone_setting(self):
+        assert SpeechInputSettings().microphone == ""
+        settings = SpeechInputSettings.from_mapping({"microphone": " Teams "})
+        assert settings.microphone == "Teams"
+
     def test_empty_language_and_prompt_mean_auto_and_none(self):
         settings = SpeechInputSettings.from_mapping(
             {"language": "", "initial_prompt": "  "}

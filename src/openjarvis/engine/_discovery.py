@@ -68,7 +68,18 @@ def _make_engine(key: str, config: JarvisConfig) -> InferenceEngine:
         host = getattr(config.engine, host_attr, None)
         if host:
             return cls(host=host)
-    return cls()
+    engine = cls()
+    apply_openrouter_policy(engine, config)
+    return engine
+
+
+def apply_openrouter_policy(engine: InferenceEngine, config: JarvisConfig) -> None:
+    """Attach the configured free-model policy to an engine that can reach
+    OpenRouter (the cloud engine). No-op for every other engine."""
+    if hasattr(engine, "openrouter_policy"):
+        from openjarvis.engine.openrouter_policy import OpenRouterPolicy
+
+        engine.openrouter_policy = OpenRouterPolicy.from_config(config)
 
 
 def _maybe_register_mining_sidecar_engine() -> None:
@@ -236,16 +247,30 @@ def get_engine(
     if not candidates:
         return None
 
-    chosen: Tuple[str, InferenceEngine] | None = None
-    if default_is_cloud is not None:
-        chosen = next(
-            (
-                candidate
-                for candidate in candidates
-                if bool(getattr(candidate[1], "is_cloud", False)) == default_is_cloud
-            ),
-            None,
-        )
+    # Never cross the local/cloud boundary on our own: a local brain that is
+    # down must not silently become a hosted one (prompts would leave the
+    # machine), nor the reverse. ``engine.allow_cross_boundary_fallback`` is
+    # the explicit opt-in. An unknown default counts as local.
+    reference_is_cloud = bool(default_is_cloud)
+    allow_cross = bool(getattr(config.engine, "allow_cross_boundary_fallback", False))
+    same_class = [
+        candidate
+        for candidate in candidates
+        if bool(getattr(candidate[1], "is_cloud", False)) == reference_is_cloud
+    ]
+    if not allow_cross:
+        if not same_class and candidates:
+            logger.warning(
+                "Default engine %r is unavailable and no %s engine is; not "
+                "crossing the local/cloud boundary "
+                "(set engine.allow_cross_boundary_fallback = true to allow it)",
+                default_key,
+                "cloud" if reference_is_cloud else "local",
+            )
+        candidates = same_class
+        if not candidates:
+            return None
+    chosen: Tuple[str, InferenceEngine] | None = same_class[0] if same_class else None
     chosen = chosen or candidates[0]
     chosen_is_cloud = bool(getattr(chosen[1], "is_cloud", False))
     boundary = (

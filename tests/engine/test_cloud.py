@@ -773,7 +773,7 @@ class TestOpenRouterToolForwarding:
         assert result.content == "The result is 42."
         assert len(result.tool_results) == 1
         assert result.tool_results[0].tool_name == "calculator"
-        assert result.tool_results[0].content == "42"
+        assert result.tool_results[0].content == "42.0"
         assert result.tool_results[0].success is True
         second_request = fake_client.chat.completions.create.call_args_list[1].kwargs
         assistant_tool_call = second_request["messages"][-2]["tool_calls"][0]

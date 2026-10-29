@@ -5,7 +5,7 @@ from openjarvis.core.config import JarvisConfig, SpeechConfig
 
 def test_speech_config_defaults():
     cfg = SpeechConfig()
-    assert cfg.backend == "auto"
+    assert cfg.backend == "mlx-whisper"
     assert cfg.model == "base"
     assert cfg.language == ""
     assert cfg.device == "auto"
@@ -16,7 +16,7 @@ def test_jarvis_config_has_speech():
     cfg = JarvisConfig()
     assert hasattr(cfg, "speech")
     assert isinstance(cfg.speech, SpeechConfig)
-    assert cfg.speech.backend == "auto"
+    assert cfg.speech.backend == "mlx-whisper"
 
 
 def test_jarvis_system_has_speech_backend():

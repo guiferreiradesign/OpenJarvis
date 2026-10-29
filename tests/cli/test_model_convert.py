@@ -4,6 +4,7 @@ from __future__ import annotations
 
 # Import the real module via importlib to patch its attributes.
 import importlib
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +17,17 @@ from click.testing import CliRunner
 from openjarvis.cli.model import model
 
 model_module = importlib.import_module("openjarvis.cli.model")
+
+
+
+def _flat(output: str) -> str:
+    """CLI output with Rich panel borders removed and whitespace collapsed.
+
+    Rich wraps at the terminal width, and a longer temp path (as under
+    ``pytest -n``) moves the wrap point, splitting phrases such as
+    ``--backend mlx`` across lines. Compare against the flattened text.
+    """
+    return " ".join(re.sub("[│╭╮╰╯─]", " ", output).split())
 
 
 class TestModelConvert:
@@ -80,8 +92,8 @@ class TestModelConvert:
         assert Path(convert_calls[0][1]) != output_dir
         assert Path(convert_calls[0][1]).parent.parent == output_dir.parent
         assert (output_dir / "config.json").is_file()
-        assert "jarvis host" in result.output
-        assert "--backend mlx" in result.output
+        assert "jarvis host" in _flat(result.output)
+        assert "--backend mlx" in _flat(result.output)
 
     def test_convert_mlx_missing_extra(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -272,8 +284,8 @@ class TestModelConvert:
             "q4_k_m",
         ]
         assert (output_dir / "some--repo.q4_k_m.gguf").read_bytes() == b"quantized"
-        assert "jarvis host" in result.output
-        assert "--backend llamacpp" in result.output
+        assert "jarvis host" in _flat(result.output)
+        assert "--backend llamacpp" in _flat(result.output)
 
     def test_convert_gguf_missing_tool(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -621,7 +633,7 @@ class TestModelConvert:
 
         assert result.exit_code == 0
         assert not output_dir.exists()
-        assert f"jarvis host some/repo --backend {engine}" in result.output
+        assert f"jarvis host some/repo --backend {engine}" in _flat(result.output)
 
     def test_llamacpp_tools_found_from_configured_binary(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -11,12 +11,13 @@ import os
 import time
 import uuid
 from collections.abc import AsyncIterator, Sequence
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 from openjarvis.core.registry import EngineRegistry
 from openjarvis.core.types import Message
+from openjarvis.engine.openrouter_policy import OpenRouterPolicy
 from openjarvis.engine._base import (
     EngineConnectionError,
     InferenceEngine,
@@ -415,6 +416,10 @@ class CloudEngine(InferenceEngine):
 
     engine_id = "cloud"
     is_cloud = True
+    # Set from configuration by the code that builds the engine; None means
+    # unrestricted (direct construction, e.g. in unit tests). A class default
+    # so instances created without __init__ stay valid.
+    openrouter_policy: Optional[OpenRouterPolicy] = None
 
     def __init__(self) -> None:
         self._openai_client: Any = None
@@ -1029,6 +1034,22 @@ class CloudEngine(InferenceEngine):
 
         return result
 
+    def _enforce_model_policy(self, model: str, extra: Any = None) -> None:
+        """Free-only mode: refuse any model that is not explicitly approved.
+
+        Runs first in every public request path, for every provider prefix, so
+        an unexpected name can never fall through to the OpenAI client (or any
+        other paid provider), and nothing is sent before the refusal.
+        """
+        if self.openrouter_policy is not None:
+            self.openrouter_policy.check(model, extra)
+
+    def _openrouter_model_id(self, model: str, extra: Any = None) -> str:
+        """Apply the free-model policy and return the bare OpenRouter model ID."""
+        if self.openrouter_policy is not None:
+            self.openrouter_policy.check(model, extra)
+        return model.removeprefix("openrouter/")
+
     def _generate_openrouter(
         self,
         messages: Sequence[Message],
@@ -1043,7 +1064,7 @@ class CloudEngine(InferenceEngine):
                 "OpenRouter client not available — set OPENROUTER_API_KEY"
             )
         # Strip the "openrouter/" prefix to get the actual model ID
-        actual_model = model.removeprefix("openrouter/")
+        actual_model = self._openrouter_model_id(model, kwargs)
         kwargs.pop("response_format", None)
         create_kwargs: Dict[str, Any] = {
             "model": actual_model,
@@ -1273,6 +1294,7 @@ class CloudEngine(InferenceEngine):
         max_tokens: int = 1024,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        self._enforce_model_policy(model, kwargs)
         kw = dict(
             model=model,
             temperature=temperature,
@@ -1304,6 +1326,7 @@ class CloudEngine(InferenceEngine):
         max_tokens: int = 1024,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
+        self._enforce_model_policy(model, kwargs)
         kw = dict(
             model=model,
             temperature=temperature,
@@ -1654,7 +1677,7 @@ class CloudEngine(InferenceEngine):
     ) -> AsyncIterator[str]:
         if self._openrouter_client is None:
             raise EngineConnectionError("OpenRouter client not available")
-        actual_model = model.removeprefix("openrouter/")
+        actual_model = self._openrouter_model_id(model, kwargs)
         create_kwargs: Dict[str, Any] = {
             "model": actual_model,
             "messages": messages_to_dicts(messages),
@@ -1795,7 +1818,7 @@ class CloudEngine(InferenceEngine):
             client = self._openrouter_client
             if client is None:
                 raise EngineConnectionError("OpenRouter client not available")
-            actual_model = model.removeprefix("openrouter/")
+            actual_model = self._openrouter_model_id(model, kwargs)
             create_kwargs: Dict[str, Any] = {
                 "model": actual_model,
                 "messages": messages_to_dicts(messages),
@@ -1982,6 +2005,7 @@ class CloudEngine(InferenceEngine):
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         """Yield StreamChunks with content, tool_calls, and finish_reason."""
+        self._enforce_model_policy(model, kwargs)
         kw = dict(
             model=model,
             temperature=temperature,
@@ -2016,6 +2040,13 @@ class CloudEngine(InferenceEngine):
             models.extend(_DEEPSEEK_MODELS)
         if self._codex_client is not None:
             models.extend(_CODEX_MODELS)
+        policy = self.openrouter_policy
+        if policy is not None and policy.free_only:
+            # Free-only mode advertises only explicitly approved models.
+            approved = policy.approved_free_models
+            models = [m for m in models if m in approved]
+            if self._openrouter_client is not None:
+                models.extend(sorted(approved - set(models)))
         return models
 
     def _client_for_model(self, model: str) -> Any:
@@ -2060,6 +2091,10 @@ class CloudEngine(InferenceEngine):
         instead of the user getting a helpful "start your local engine"
         message (see #532).
         """
+        policy = self.openrouter_policy
+        if policy is not None and policy.free_only:
+            if model not in policy.approved_free_models:
+                return False
         return self._client_for_model(model) is not None
 
     def health(self) -> bool:

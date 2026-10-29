@@ -995,27 +995,63 @@ async def transcribe_speech(request: Request):
     """Transcribe uploaded audio to text."""
     backend = getattr(request.app.state, "speech_backend", None)
     if backend is None:
-        raise HTTPException(status_code=501, detail="Speech backend not configured")
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "No local speech-to-text backend is available. Cloud speech is "
+                "never used unless speech.backend names it explicitly"
+            ),
+        )
 
     form = await request.form()
     audio_file = form.get("file")
     if audio_file is None:
         raise HTTPException(status_code=400, detail="Missing 'file' field")
 
-    audio_bytes = await audio_file.read()
     language = form.get("language")
 
-    # Detect format from filename
-    filename = getattr(audio_file, "filename", "audio.wav")
-    ext = filename.rsplit(".", 1)[-1] if "." in filename else "wav"
+    from jarvis_ext.speech.convert import (
+        MAX_UPLOAD_BYTES,
+        AudioTooLarge,
+        UnsupportedAudioFormat,
+        prepare_for_transcription,
+    )
+    from jarvis_ext.speech.errors import (
+        SpeechInputError,
+        SpeechTimeoutError,
+        SpeechUnavailableError,
+    )
+
+    audio_bytes = await audio_file.read(MAX_UPLOAD_BYTES + 1)
+
+    # Browsers send WebM/Opus; the local recogniser reads 16 kHz mono WAV.
+    # Valid WAV passes through untouched; the format comes from the bytes, not
+    # from the file name or content type.
+    try:
+        prepared = await asyncio.to_thread(prepare_for_transcription, audio_bytes)
+    except UnsupportedAudioFormat as exc:
+        raise HTTPException(status_code=415, detail=str(exc)) from exc
+    except AudioTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except SpeechInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SpeechTimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except SpeechUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Audio conversion failed")
+        raise HTTPException(status_code=500, detail="Audio conversion failed") from exc
 
     try:
         result = await asyncio.to_thread(
             backend.transcribe,
-            audio_bytes,
-            format=ext,
+            prepared.wav,
+            format="wav",
             language=language or None,
         )
+    except SpeechInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Speech transcription failed")
         raise HTTPException(
@@ -1036,7 +1072,10 @@ async def speech_health(request: Request):
     """Check if a speech backend is available."""
     backend = getattr(request.app.state, "speech_backend", None)
     if backend is None:
-        return {"available": False, "reason": "No speech backend configured"}
+        return {
+            "available": False,
+            "reason": "No local speech-to-text backend is available",
+        }
     try:
         available = backend.health()
         reason = None
@@ -1091,6 +1130,15 @@ async def _resolve_tts_backend(request: Request):
                 config = load_config()
 
             preferred, _, _ = voice_preferences(config)
+            allow_cloud = bool(
+                getattr(
+                    getattr(config, "speech", None),
+                    "allow_cloud_tts_fallback",
+                    False,
+                )
+            )
+            if allow_cloud:
+                return get_tts_backend(preferred, allow_cloud=True)
             return get_tts_backend(preferred)
 
         task = asyncio.create_task(asyncio.to_thread(discover))

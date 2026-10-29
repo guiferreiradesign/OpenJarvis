@@ -105,6 +105,23 @@ export const authHeaders = (
   return key ? { ...extra, Authorization: `Bearer ${key}` } : { ...extra };
 };
 
+/** Stable random browser-tab session binding used for dashboard-only approvals. */
+let fallbackDashboardSessionId = '';
+export function getDashboardSessionId(): string {
+  const key = 'openjarvis-dashboard-chat-session';
+  try {
+    let id = sessionStorage.getItem(key);
+    if (!id) {
+      id = crypto.randomUUID();
+      sessionStorage.setItem(key, id);
+    }
+    return id;
+  } catch {
+    if (!fallbackDashboardSessionId) fallbackDashboardSessionId = crypto.randomUUID();
+    return fallbackDashboardSessionId;
+  }
+}
+
 // Centralized fetch for the local server: prepends getBase() and injects the
 // Bearer auth header (when a key is set) on every call. Using this everywhere
 // guarantees no /v1 or /api request is sent without auth — the bug in #266 was
@@ -240,6 +257,35 @@ export async function deleteModel(modelName: string): Promise<void> {
   }
 }
 
+export interface GmailSendApproval {
+  id: string;
+  message: { to: string; subject: string; body: string };
+  status: string;
+  result?: { message_id?: string; thread_id?: string } | null;
+}
+
+export async function fetchGmailSendApproval(id: string, approvalToken: string): Promise<GmailSendApproval> {
+  const res = await apiFetch(`/v1/gmail/approvals/${encodeURIComponent(id)}`, { headers: { 'X-OpenJarvis-Approval': approvalToken, 'X-OpenJarvis-Chat-Session': getDashboardSessionId() } });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || 'Could not load approval.');
+  return data;
+}
+
+export async function confirmGmailSendApproval(id: string, approvalToken: string): Promise<{ status: string; message_id?: string }> {
+  return gmailApprovalAction(id, approvalToken, 'confirm');
+}
+
+export async function cancelGmailSendApproval(id: string, approvalToken: string): Promise<{ status: string; message_id?: string }> {
+  return gmailApprovalAction(id, approvalToken, 'cancel');
+}
+
+async function gmailApprovalAction(id: string, approvalToken: string, action: 'confirm' | 'cancel'): Promise<any> {
+  const res = await apiFetch(`/v1/gmail/approvals/${encodeURIComponent(id)}/${action}`, { method: 'POST', headers: { 'X-OpenJarvis-Approval': approvalToken, 'X-OpenJarvis-Chat-Session': getDashboardSessionId() } });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || 'Approval request failed.');
+  return data;
+}
+
 const _CLOUD_PREFIXES = ['gpt-', 'o1-', 'o3-', 'o4-', 'claude-', 'gemini-', 'openrouter/'];
 
 export async function preloadModel(modelName: string, owner?: string): Promise<void> {
@@ -362,7 +408,11 @@ export interface SpeechHealth {
   reason?: string;
 }
 
-export async function transcribeAudio(audioBlob: Blob, filename = 'recording.webm'): Promise<TranscriptionResult> {
+export async function transcribeAudio(
+  audioBlob: Blob,
+  filename = 'recording.webm',
+  signal?: AbortSignal,
+): Promise<TranscriptionResult> {
   if (isTauri()) {
     try {
       const buffer = await audioBlob.arrayBuffer();
@@ -380,6 +430,7 @@ export async function transcribeAudio(audioBlob: Blob, filename = 'recording.web
   const res = await apiFetch(`/v1/speech/transcribe`, {
     method: 'POST',
     body: formData,
+    signal,
   });
   if (!res.ok) {
     let detail = "";

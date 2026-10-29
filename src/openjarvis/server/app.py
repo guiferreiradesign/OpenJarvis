@@ -8,8 +8,8 @@ import pathlib
 import threading
 import time
 
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from openjarvis.server.analytics_routes import (
@@ -474,11 +474,49 @@ def create_app(
                 except Exception:
                     pass
 
+    from openjarvis.engine.openrouter_policy import OpenRouterModelNotAllowed
+
+    @app.exception_handler(OpenRouterModelNotAllowed)
+    async def _model_not_approved(request: Request, exc: OpenRouterModelNotAllowed):
+        """Free-only mode refused the model before any provider was contacted.
+
+        A client error (400), not a server fault: the message says what is
+        approved and that nothing was sent.
+        """
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": "invalid_request_error",
+                    "code": "model_not_approved",
+                }
+            },
+        )
+
+    from openjarvis.engine.multi import ModelNotFoundError
+
+    @app.exception_handler(ModelNotFoundError)
+    async def _model_not_found(request: Request, exc: ModelNotFoundError):
+        """No engine serves this model: a client error, nothing was contacted."""
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": "invalid_request_error",
+                    "code": "model_not_found",
+                }
+            },
+        )
+
     app.include_router(router)
     app.include_router(dashboard_router)
     app.include_router(comparison_router)
     app.include_router(create_connectors_router())
     app.include_router(create_digest_router())
+    from openjarvis.server.gmail_approval import router as gmail_approval_router
+    app.include_router(gmail_approval_router)
     app.include_router(upload_router)
     app.include_router(research_router)
     app.include_router(analytics_router)

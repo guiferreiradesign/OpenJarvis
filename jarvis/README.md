@@ -11,7 +11,9 @@ untouched.
 | [media-workspace.md](media-workspace.md) | The first JARVIS capability: read-only media-workspace inspection |
 | [video-pipeline.md](video-pipeline.md) | Phase 2: `EditPlan`, `media_render`, `media_validate`, output versioning and safety |
 | [jobs.md](jobs.md) | Phase 3: jobs, worker and CLI, progress, notifications, revisions and reuse, agent job tools |
-| [speech.md](speech.md) | Phase 4.1: speech input (MLX Whisper Base) and speech output (Voicebox) providers |
+| [speech.md](speech.md) | Phase 4.1: speech input (MLX Whisper Base) and speech output providers (VoiceStudio with Kokoro George; Voicebox kept but unused) |
+| [preflight.md](preflight.md) | `python -m jarvis_ext preflight`: the standard verification step, its checks, statuses, opt-in flags, and the rule that critical changes need tests plus preflight before they are reported complete |
+| [voicestudio-plan.md](voicestudio-plan.md) | Voice output: the VoiceStudio adapter is implemented (Kokoro George); plan for the rest of the voice layer (profiles, audio cache, chunking, interruption) |
 | [examples/edit-plan.example.json](examples/edit-plan.example.json) | A complete example edit plan |
 | [DECISIONS.md](DECISIONS.md) | Architecture decisions and assumptions |
 | [ROADMAP.md](ROADMAP.md) | Phases 1–8, the next milestone (First Usable Interface) and the Mac checklist |
@@ -53,10 +55,16 @@ src/jarvis_ext/            # JARVIS extension package (custom code only)
         render_job.py      #     video.render job handler (uses the tools)
     speech/                #   speech providers (Phase 4.1), not tools
         mlx_whisper.py     #     speech-to-text: MLX Whisper (SpeechBackend)
-        voicebox.py        #     text-to-speech: local Voicebox (TTSBackend)
+        voicestudio.py     #     text-to-speech: local VoiceStudio, Kokoro George (TTSBackend)
+        voicebox.py        #     earlier Voicebox provider (registered, not the default)
         audio.py           #     in-process WAV decoding to 16 kHz mono
-        settings.py        #     [jarvis.speech_input] / [jarvis.speech_output]
+        settings.py        #     [jarvis.speech_input] / [jarvis.speech_output] / [jarvis.voicestudio]
         errors.py          #     SpeechError and subclasses
+    preflight/             #   `python -m jarvis_ext preflight` (see preflight.md)
+        core.py            #     check registry, runner, report, secret redaction
+        fixtures.py        #     synthetic media for the media/job checks
+        cli.py             #     arguments and exit status
+        checks/            #     app, media, jobs, brain, future (one module per group)
 tests/jarvis_ext/          # tests for the extension package
 jarvis/                    # this documentation
 ```
@@ -111,7 +119,7 @@ The fork touches upstream files in these places:
 | Scheduling / background jobs | **Available upstream** | `TaskScheduler` (cron/interval/once) + operators |
 | Memory / preferences | **Available upstream** | Fact store + retrieval backends |
 | Approvals | **Partial upstream** | Interactive confirmation + a proactive-agent approval queue with REST routes |
-| Voice | **Providers implemented** (JARVIS) | MLX Whisper Base (input) and local Voicebox/Kokoro (output) behind upstream's speech interfaces; no microphone or voice loop yet. See speech.md |
+| Voice | **Providers implemented** (JARVIS) | MLX Whisper Base (input) and local VoiceStudio, Kokoro George `bm_george` (output) behind upstream's speech interfaces; no microphone or voice loop yet. See speech.md |
 | Email / notifications | **Available upstream** (channels) | Not configured; sending is out of scope for Phase 1 |
 | Video rendering from an explicit edit plan | **Implemented** (JARVIS) | `media_render` + `media_validate`, 1080×1920 Reels preset, versioned outputs, preview/thumbnail. Real-FFmpeg tested on macOS with generated media. See video-pipeline.md |
 | Autonomous editing ("strongest moments") | **Planned** | Phase 8 |
@@ -164,7 +172,12 @@ uv run jarvis ask --agent orchestrator --tools media_workspace_inspect \
 
 ```bash
 uv run pytest tests/jarvis_ext -v
+uv run python -m jarvis_ext preflight      # see preflight.md
 ```
+
+Both are required before a change to critical functionality is reported
+complete (the rule is in [preflight.md](preflight.md)). The preflight covers
+only the checks it lists; it is not a full end-to-end test.
 
 The real-FFmpeg tests skip automatically if `ffmpeg`/`ffprobe` are missing.
 The compiled Rust extension (`openjarvis_rust`, built by the `maturin

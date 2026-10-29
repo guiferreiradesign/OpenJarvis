@@ -14,15 +14,9 @@ from __future__ import annotations
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-try:
-    import torch  # noqa: F401
-except ImportError as exc:
-    raise ImportError(
-        "PyTorch is required for the ColBERT memory backend. "
-        "Install it with:\n\n"
-        "    pip install torch\n"
-    ) from exc
-
+# colbert-ai is checked first: when it is missing this module fails here, before
+# importing torch (and numpy), so importing the CLI stays light on machines that
+# have torch for other reasons (for example mlx-whisper).
 try:
     from colbert.modeling.checkpoint import Checkpoint  # noqa: F401
 except ImportError as exc:
@@ -30,6 +24,15 @@ except ImportError as exc:
         "The 'colbert-ai' package is required for the ColBERT "
         "memory backend. Install it with:\n\n"
         "    pip install colbert-ai\n"
+    ) from exc
+
+try:
+    import torch  # noqa: F401
+except ImportError as exc:
+    raise ImportError(
+        "PyTorch is required for the ColBERT memory backend. "
+        "Install it with:\n\n"
+        "    pip install torch\n"
     ) from exc
 
 from openjarvis.core.events import EventType, get_event_bus

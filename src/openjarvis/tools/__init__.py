@@ -179,6 +179,11 @@ except ImportError:
     pass
 
 try:
+    import openjarvis.tools.gmail_tools  # noqa: F401
+except ImportError:
+    pass
+
+try:
     import openjarvis.tools.proactive_tools  # noqa: F401
 except ImportError:
     pass

@@ -372,6 +372,20 @@ class OllamaEngineConfig:
 
 
 @dataclass(slots=True)
+class OpenRouterEngineConfig:
+    """OpenRouter safety policy: only exactly-listed free models are requested.
+
+    There is no automatic model fallback. A rate-limited or unavailable free
+    model produces an error; it is never replaced by another model.
+    """
+
+    free_only: bool = True
+    approved_free_models: list[str] = field(
+        default_factory=lambda: ["openrouter/cohere/north-mini-code:free"]
+    )
+
+
+@dataclass(slots=True)
 class VLLMEngineConfig:
     """Per-engine config for vLLM."""
 
@@ -478,6 +492,10 @@ class EngineConfig:
     """Inference engine settings with nested per-engine configs."""
 
     default: str = "ollama"
+    # Off by default: when the default engine is down, fallback stays on the
+    # same side (local or cloud). True lets it cross to the other side.
+    allow_cross_boundary_fallback: bool = False
+    openrouter: OpenRouterEngineConfig = field(default_factory=OpenRouterEngineConfig)
     ollama: OllamaEngineConfig = field(default_factory=OllamaEngineConfig)
     vllm: VLLMEngineConfig = field(default_factory=VLLMEngineConfig)
     sglang: SGLangEngineConfig = field(default_factory=SGLangEngineConfig)
@@ -1623,7 +1641,9 @@ class OperatorsConfig:
 class SpeechConfig:
     """Speech-to-text settings."""
 
-    backend: str = "auto"  # "auto", "faster-whisper", "openai", "deepgram"
+    # "mlx-whisper" is JARVIS's local recogniser; "auto" tries only local backends
+    # and never a cloud one; "openai"/"deepgram" must be chosen explicitly.
+    backend: str = "mlx-whisper"  # "mlx-whisper", "auto", "faster-whisper", "openai", ...
     model: str = "base"  # Whisper model size: tiny, base, small, medium, large-v3
     language: str = ""  # Empty = auto-detect
     device: str = "auto"  # "auto", "cpu", "cuda"
@@ -1631,11 +1651,16 @@ class SpeechConfig:
     # Text-to-speech. ``voice_id`` is interpreted by ``tts_backend`` only --
     # voice IDs are not portable between backends, so if voice output falls
     # back to a different backend that backend's own default voice is used.
+    # "voicestudio" is JARVIS's local voice (Kokoro via VoiceStudio); its model,
+    # language and URL come from [jarvis.voicestudio].
     # Kokoro IDs: bm_george / bm_lewis (British male), bf_emma / bf_isabella
     # (British female), af_* / am_* (American).
-    tts_backend: str = "kokoro"  # "kokoro", "openai_tts", "cartesia", "elevenlabs"
+    tts_backend: str = "voicestudio"  # "voicestudio", "kokoro", "openai_tts", ...
     voice_id: str = "bm_george"
     voice_speed: float = 1.0
+    # Off by default: a cloud voice is used only when it is the configured
+    # ``tts_backend`` or this is true. Never a silent fallback.
+    allow_cloud_tts_fallback: bool = False
 
 
 @dataclass(slots=True)

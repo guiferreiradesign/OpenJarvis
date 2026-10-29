@@ -10,7 +10,7 @@ from jarvis_ext.__main__ import main
 from jarvis_ext.speech import mlx_whisper as mw
 from jarvis_ext.speech.errors import SpeechUnavailableError
 from jarvis_ext.speech.mlx_whisper import MlxWhisperBackend
-from jarvis_ext.speech.voicebox import VoiceboxTTSBackend
+from jarvis_ext.speech.voicestudio import VoiceStudioTTSBackend
 from openjarvis.speech.tts import TTSResult
 
 
@@ -23,15 +23,18 @@ def config(tmp_path):
 
 def test_check_reports_both_providers_without_loading(config, monkeypatch, capsys):
     monkeypatch.setattr(mw, "_module_present", lambda name: False)
-    monkeypatch.setattr(VoiceboxTTSBackend, "health", lambda self: False)
+    monkeypatch.setattr(VoiceStudioTTSBackend, "health", lambda self: False)
     assert main(["speech-check", "--config", str(config)]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["speech_input"]["loaded"] is False
     assert report["speech_input"]["error"]
     assert report["speech_output"] == {
-        "backend": "voicebox",
-        "base_url": "http://127.0.0.1:17493",
+        "backend": "voicestudio",
+        "base_url": "http://127.0.0.1:3900",
         "running": False,
+        "model": "mlx-audio",
+        "voice": "bm_george",
+        "language": "British English",
     }
 
 
@@ -67,7 +70,7 @@ def test_say_writes_a_new_file_only(config, tmp_path, monkeypatch, capsys):
         calls.append(text)
         return TTSResult(audio=b"RIFFdata", format="wav", sample_rate=24000)
 
-    monkeypatch.setattr(VoiceboxTTSBackend, "synthesize", synthesize)
+    monkeypatch.setattr(VoiceStudioTTSBackend, "synthesize", synthesize)
     out = tmp_path / "say.wav"
     assert main(["speech-say", "Hi", "--out", str(out), "--config", str(config)]) == 0
     assert out.read_bytes() == b"RIFFdata"
@@ -80,7 +83,7 @@ def test_say_reports_provider_errors(config, tmp_path, monkeypatch, capsys):
     def synthesize(self, text, **kwargs):
         raise SpeechUnavailableError("Voicebox is not running on this machine")
 
-    monkeypatch.setattr(VoiceboxTTSBackend, "synthesize", synthesize)
+    monkeypatch.setattr(VoiceStudioTTSBackend, "synthesize", synthesize)
     argv = ["speech-say", "Hi", "--out", str(tmp_path / "x.wav")]
     assert main([*argv, "--config", str(config)]) == 1
     assert "not running" in capsys.readouterr().err

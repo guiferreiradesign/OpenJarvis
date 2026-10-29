@@ -15,6 +15,22 @@ from httpx import ASGITransport, AsyncClient  # noqa: E402
 from openjarvis.speech._stubs import TranscriptionResult  # noqa: E402
 
 
+def _wav(seconds: float = 0.1, rate: int = 16000) -> bytes:
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(b"\x01\x00" * int(rate * seconds))
+    return buf.getvalue()
+
+
+WAV = _wav()
+
+
 @pytest.fixture
 def mock_speech_backend():
     backend = MagicMock()
@@ -50,7 +66,7 @@ def client(app_with_speech):
 def test_transcribe_endpoint(client, mock_speech_backend):
     response = client.post(
         "/v1/speech/transcribe",
-        files={"file": ("test.wav", b"fake audio data", "audio/wav")},
+        files={"file": ("test.wav", WAV, "audio/wav")},
     )
     assert response.status_code == 200
     data = response.json()
@@ -69,20 +85,28 @@ def test_transcribe_endpoint_offloads_backend_work(client, mock_speech_backend):
         segments=[],
     )
 
+    real_to_thread = asyncio.to_thread
+    calls = []
+
+    async def fake_to_thread(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        if func is mock_speech_backend.transcribe:
+            return expected
+        return await real_to_thread(func, *args, **kwargs)  # audio preparation
+
     with patch(
         "openjarvis.server.api_routes.asyncio.to_thread",
-        new_callable=AsyncMock,
-    ) as mock_to_thread:
-        mock_to_thread.return_value = expected
+        side_effect=fake_to_thread,
+    ):
         response = client.post(
             "/v1/speech/transcribe",
-            files={"file": ("test.wav", b"fake audio data", "audio/wav")},
+            files={"file": ("test.wav", WAV, "audio/wav")},
         )
 
     assert response.status_code == 200
-    mock_to_thread.assert_awaited_once()
-    args, kwargs = mock_to_thread.await_args
-    assert args == (mock_speech_backend.transcribe, b"fake audio data")
+    func, args, kwargs = calls[-1]
+    assert func is mock_speech_backend.transcribe
+    assert args == (WAV,)  # valid WAV passes through unchanged
     assert kwargs == {"format": "wav", "language": None}
     assert response.json()["text"] == "Offloaded"
 
@@ -92,7 +116,7 @@ def test_transcribe_endpoint_surfaces_backend_error(client, mock_speech_backend)
 
     response = client.post(
         "/v1/speech/transcribe",
-        files={"file": ("test.wav", b"fake audio data", "audio/wav")},
+        files={"file": ("test.wav", WAV, "audio/wav")},
     )
 
     assert response.status_code == 500
@@ -384,3 +408,104 @@ def test_voice_id_not_reused_across_backends(mock_tts_backend):
 
     # Backend is mock_tts, not the configured kokoro, so bm_george must not leak.
     assert mock_tts_backend.synthesize.call_args.kwargs["voice_id"] != "bm_george"
+
+
+# -- Step 2: browser audio is converted for the local recogniser ---------------
+
+
+def _post(client, data, name="clip.webm", ctype="audio/webm"):
+    return client.post("/v1/speech/transcribe", files={"file": (name, data, ctype)})
+
+
+def test_browser_webm_is_converted_to_wav_before_transcription(
+    client, mock_speech_backend
+):
+    from jarvis_ext.speech.convert import PreparedAudio
+
+    converted = _wav(seconds=0.2)
+    with patch(
+        "jarvis_ext.speech.convert.prepare_for_transcription",
+        return_value=PreparedAudio(wav=converted, converted=True, source_format="webm"),
+    ) as prepare:
+        response = _post(client, b"\x1a\x45\xdf\xa3" + b"\x00" * 32)
+    assert response.status_code == 200
+    prepare.assert_called_once()
+    args, kwargs = mock_speech_backend.transcribe.call_args
+    assert args == (converted,) and kwargs["format"] == "wav"
+
+
+def test_wav_is_not_converted(client, mock_speech_backend):
+    with patch("jarvis_ext.speech.convert.subprocess.run") as run:
+        response = _post(client, WAV, "a.wav", "audio/wav")
+    assert response.status_code == 200
+    run.assert_not_called()
+    assert mock_speech_backend.transcribe.call_args.args == (WAV,)
+
+
+def test_empty_recording_is_a_400(client, mock_speech_backend):
+    response = _post(client, b"")
+    assert response.status_code == 400
+    assert "empty" in response.json()["detail"]
+    mock_speech_backend.transcribe.assert_not_called()
+
+
+def test_unsupported_format_is_a_415(client, mock_speech_backend):
+    response = _post(client, b"ID3\x04 an mp3", "x.wav", "audio/wav")
+    assert response.status_code == 415
+    mock_speech_backend.transcribe.assert_not_called()
+
+
+def test_malformed_wav_is_a_400(client, mock_speech_backend):
+    response = _post(client, b"RIFF\x00\x00\x00\x00WAVEjunk", "a.wav", "audio/wav")
+    assert response.status_code == 400
+    mock_speech_backend.transcribe.assert_not_called()
+
+
+def test_oversized_upload_is_a_413(client, mock_speech_backend):
+    big = b"\x1a\x45\xdf\xa3" + b"\x00" * (26 * 1024 * 1024)
+    assert _post(client, big).status_code == 413
+    mock_speech_backend.transcribe.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        ("SpeechTimeoutError", 504),
+        ("SpeechUnavailableError", 503),
+        ("SpeechInputError", 400),
+    ],
+)
+def test_conversion_errors_map_to_http_statuses(
+    client, mock_speech_backend, error, status
+):
+    from jarvis_ext.speech import errors
+
+    with patch(
+        "jarvis_ext.speech.convert.prepare_for_transcription",
+        side_effect=getattr(errors, error)("conversion problem"),
+    ):
+        response = _post(client, b"\x1a\x45\xdf\xa3")
+    assert response.status_code == status
+    assert response.json()["detail"] == "conversion problem"
+    mock_speech_backend.transcribe.assert_not_called()
+
+
+def test_synthesize_uses_configured_george_voice_when_browser_sends_none(
+    mock_tts_backend,
+):
+    """The browser sends only text; the backend config decides the voice."""
+    mock_tts_backend.backend_id = "voicestudio"
+    config = SimpleNamespace(
+        speech=SimpleNamespace(
+            tts_backend="voicestudio", voice_id="bm_george", voice_speed=1.0
+        )
+    )
+    client = _tts_app(mock_tts_backend, config=config)
+
+    response = client.post("/v1/speech/synthesize", json={"text": "Good evening."})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/wav"
+    kwargs = mock_tts_backend.synthesize.call_args.kwargs
+    assert kwargs["voice_id"] == "bm_george"
+    assert kwargs["output_format"] == "wav"

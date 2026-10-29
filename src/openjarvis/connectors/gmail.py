@@ -16,6 +16,7 @@ import time
 from datetime import datetime
 from html.parser import HTMLParser
 from typing import Any, Dict, Iterator, List, Optional, Tuple
+from urllib.parse import quote
 
 import httpx
 
@@ -27,12 +28,11 @@ from openjarvis.connectors.google_auth import (
     call_with_refresh as _call_with_refresh,
 )
 from openjarvis.connectors.oauth import (
-    GOOGLE_ALL_SCOPES,
+    GOOGLE_GMAIL_SCOPES,
     build_google_auth_url,
     delete_tokens,
     load_tokens,
     refresh_google_token,
-    resolve_google_credentials,
     save_tokens,
 )
 from openjarvis.core.config import DEFAULT_CONFIG_DIR
@@ -185,6 +185,40 @@ def _gmail_api_get_message(token: str, msg_id: str) -> Dict[str, Any]:
         Raw API response for the message resource.
     """
     resp = _gmail_get(f"{_GMAIL_API_BASE}/messages/{msg_id}", token, {"format": "full"})
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _gmail_api_get_thread(token: str, thread_id: str) -> Dict[str, Any]:
+    """Fetch a full Gmail thread by ID."""
+    safe_id = quote(thread_id, safe="")
+    resp = _gmail_get(
+        f"{_GMAIL_API_BASE}/threads/{safe_id}", token, {"format": "full"}
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _gmail_api_create_draft(token: str, raw_message: str) -> Dict[str, Any]:
+    """Create a Gmail draft. This endpoint does not send the message."""
+    resp = httpx.post(
+        f"{_GMAIL_API_BASE}/drafts",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"message": {"raw": raw_message}},
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _gmail_api_send_message(token: str, raw_message: str) -> Dict[str, Any]:
+    """Send a MIME message through Gmail's messages.send API."""
+    resp = httpx.post(
+        f"{_GMAIL_API_BASE}/messages/send",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"raw": raw_message},
+        timeout=30.0,
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -382,9 +416,10 @@ class GmailConnector(BaseConnector):
     auth_type = "oauth"
 
     def __init__(self, credentials_path: str = "") -> None:
-        self._credentials_path = resolve_google_credentials(
-            credentials_path or _DEFAULT_CREDENTIALS_PATH
-        )
+        # Gmail now has an isolated read/draft OAuth grant. Do not fall back
+        # to google.json, whose token may have unrelated scopes and whose
+        # disconnect would affect every other Google connector.
+        self._credentials_path = credentials_path or _DEFAULT_CREDENTIALS_PATH
         self._items_synced: int = 0
         self._items_total: int = 0
         self._last_sync: Optional[datetime] = None
@@ -412,10 +447,10 @@ class GmailConnector(BaseConnector):
         delete_tokens(self._credentials_path)
 
     def auth_url(self) -> str:
-        """Return a Google OAuth consent URL for the shared Google scopes."""
+        """Return a Google OAuth consent URL for Gmail read and draft scopes."""
         return build_google_auth_url(
             client_id="",  # placeholder — real client_id from config
-            scopes=GOOGLE_ALL_SCOPES,
+            scopes=GOOGLE_GMAIL_SCOPES,
         )
 
     def handle_callback(self, code: str) -> None:

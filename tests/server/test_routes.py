@@ -743,6 +743,154 @@ class TestChatCompletions:
         assert executions == ["README.md"]
         assert engine.generate.call_count == 2
 
+    @pytest.mark.parametrize(
+        ("expression", "expected_result", "success", "final_answer"),
+        [
+            ("6 * 7", "42.0", True, "The calculator returned 42."),
+            (
+                "foo(1)",
+                "Error: Unknown function: foo",
+                False,
+                "The calculation failed.",
+            ),
+        ],
+    )
+    def test_streaming_agent_forwards_openrouter_calculator_events(
+        self, expression, expected_result, success, final_answer
+    ):
+        """Forward actual calculator execution evidence through chat SSE."""
+        from types import SimpleNamespace
+
+        from openjarvis.agents.orchestrator import OrchestratorAgent
+        from openjarvis.engine.cloud import CloudEngine
+        from openjarvis.tools.calculator import CalculatorTool
+
+        executions: list[str] = []
+
+        class _RecordingCalculator(CalculatorTool):
+            def execute(self, **params):
+                executions.append(params["expression"])
+                return super().execute(**params)
+
+        def completion(content, tool_calls=None):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=content,
+                            tool_calls=tool_calls,
+                        ),
+                        finish_reason="tool_calls" if tool_calls else "stop",
+                    )
+                ],
+                usage=SimpleNamespace(
+                    prompt_tokens=5,
+                    completion_tokens=3,
+                    total_tokens=8,
+                ),
+                model="cohere/north-mini-code:free",
+            )
+
+        provider_tool_call = SimpleNamespace(
+            id="call_calculator",
+            type="function",
+            function=SimpleNamespace(
+                name="calculator",
+                arguments=json.dumps({"expression": expression}),
+            ),
+        )
+        openrouter_client = MagicMock()
+        openrouter_client.chat.completions.create.side_effect = [
+            completion("", [provider_tool_call]),
+            completion(final_answer),
+        ]
+        engine = CloudEngine.__new__(CloudEngine)
+        engine._openrouter_client = openrouter_client
+
+        bus = EventBus()
+        agent = OrchestratorAgent(
+            engine,
+            "openrouter/cohere/north-mini-code:free",
+            tools=[_RecordingCalculator()],
+            bus=bus,
+            agent_id="orchestrator",
+            parallel_tools=False,
+            max_turns=3,
+        )
+        app = create_app(
+            engine,
+            "openrouter/cohere/north-mini-code:free",
+            agent=agent,
+            bus=bus,
+            config=_test_config(),
+        )
+
+        resp = TestClient(app).post(
+            "/v1/chat/completions",
+            json={
+                "model": "openrouter/cohere/north-mini-code:free",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"Use the calculator for {expression}.",
+                    }
+                ],
+                "stream": True,
+            },
+        )
+
+        assert resp.status_code == 200
+        blocks = [block for block in resp.text.split("\n\n") if block.strip()]
+        named_events = []
+        streamed_content = ""
+        finish_chunk = None
+        end_event_index = None
+        final_content_index = None
+        for block_index, block in enumerate(blocks):
+            lines = block.splitlines()
+            event_line = next(
+                (line for line in lines if line.startswith("event: ")), None
+            )
+            data_line = next(
+                (line for line in lines if line.startswith("data: ")), None
+            )
+            if event_line and data_line:
+                event_name = event_line.removeprefix("event: ")
+                named_events.append((event_name, json.loads(data_line[6:])))
+                if event_name == "tool_call_end":
+                    end_event_index = block_index
+            elif data_line and data_line[6:] != "[DONE]":
+                chunk = json.loads(data_line[6:])
+                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                if delta.get("content") == final_answer:
+                    final_content_index = block_index
+                streamed_content += delta.get("content") or ""
+                if chunk.get("choices", [{}])[0].get("finish_reason") == "stop":
+                    finish_chunk = chunk
+
+        assert executions == [expression]
+        event_names = [name for name, _ in named_events]
+        assert event_names == ["tool_call_start", "tool_call_end"]
+        start_data = named_events[0][1]
+        assert start_data["tool"] == "calculator"
+        assert json.loads(start_data["arguments"]) == {"expression": expression}
+        end_data = named_events[1][1]
+        assert end_data["tool"] == "calculator"
+        assert end_data["success"] is success
+        assert end_data["result"] == expected_result
+        assert streamed_content == final_answer
+        assert end_event_index is not None and final_content_index is not None
+        assert end_event_index < final_content_index
+        assert finish_chunk is not None
+        assert finish_chunk["usage"]["total_tokens"] == 16
+        assert "data: [DONE]" in resp.text
+
+        sent_messages = openrouter_client.chat.completions.create.call_args_list[
+            1
+        ].kwargs["messages"]
+        assert sent_messages[-1]["role"] == "tool"
+        assert sent_messages[-1]["content"] == expected_result
+
     def test_streaming_with_tools_emits_tool_calls_and_bypasses_agent(self):
         """Regression for the streaming analog of #414.
 

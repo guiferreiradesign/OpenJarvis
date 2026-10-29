@@ -2,8 +2,10 @@
 
 * ``mlx_whisper.MlxWhisperBackend`` – speech-to-text (``SpeechBackend``),
   registered as ``"mlx-whisper"``.
-* ``voicebox.VoiceboxTTSBackend`` – text-to-speech (``TTSBackend``),
-  registered as ``"voicebox"``.
+* ``voicestudio.VoiceStudioTTSBackend`` – text-to-speech (``TTSBackend``),
+  registered as ``"voicestudio"``: JARVIS's voice (Kokoro, ``bm_george``).
+* ``voicebox.VoiceboxTTSBackend`` – the earlier Voicebox provider, still
+  registered as ``"voicebox"`` but no longer the default.
 
 Both implement the upstream OpenJarvis interfaces in
 ``openjarvis.speech._stubs`` and ``openjarvis.speech.tts``, so agents and
@@ -25,7 +27,8 @@ from typing import Any
 from openjarvis.core.registry import SpeechRegistry, TTSRegistry
 
 STT_BACKEND_ID = "mlx-whisper"
-TTS_BACKEND_ID = "voicebox"
+TTS_BACKEND_ID = "voicestudio"
+VOICEBOX_BACKEND_ID = "voicebox"
 
 
 def create_mlx_whisper(**kwargs: Any) -> Any:
@@ -33,6 +36,13 @@ def create_mlx_whisper(**kwargs: Any) -> Any:
     from jarvis_ext.speech.mlx_whisper import MlxWhisperBackend
 
     return MlxWhisperBackend(**kwargs)
+
+
+def create_voicestudio(**kwargs: Any) -> Any:
+    """Create a :class:`VoiceStudioTTSBackend` (registry factory)."""
+    from jarvis_ext.speech.voicestudio import VoiceStudioTTSBackend
+
+    return VoiceStudioTTSBackend(**kwargs)
 
 
 def create_voicebox(**kwargs: Any) -> Any:
@@ -47,13 +57,17 @@ def ensure_registered() -> None:
     if not SpeechRegistry.contains(STT_BACKEND_ID):
         SpeechRegistry.register_value(STT_BACKEND_ID, create_mlx_whisper)
     if not TTSRegistry.contains(TTS_BACKEND_ID):
-        TTSRegistry.register_value(TTS_BACKEND_ID, create_voicebox)
+        TTSRegistry.register_value(TTS_BACKEND_ID, create_voicestudio)
+    if not TTSRegistry.contains(VOICEBOX_BACKEND_ID):
+        TTSRegistry.register_value(VOICEBOX_BACKEND_ID, create_voicebox)
 
 
 __all__ = [
     "STT_BACKEND_ID",
     "TTS_BACKEND_ID",
+    "VOICEBOX_BACKEND_ID",
     "create_mlx_whisper",
+    "create_voicestudio",
     "create_voicebox",
     "ensure_registered",
 ]

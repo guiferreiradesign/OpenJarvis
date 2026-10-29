@@ -32,10 +32,9 @@ export default function App() {
     }
   }, []);
   const prevModelRef = useRef<string>('');
-  const setModels = useAppStore((s) => s.setModels);
+  const initializeModels = useAppStore((s) => s.initializeModels);
   const setModelsLoading = useAppStore((s) => s.setModelsLoading);
   const selectedModel = useAppStore((s) => s.selectedModel);
-  const setServerInfo = useAppStore((s) => s.setServerInfo);
   const setSavings = useAppStore((s) => s.setSavings);
   const settings = useAppStore((s) => s.settings);
   const commandPaletteOpen = useAppStore((s) => s.commandPaletteOpen);
@@ -67,19 +66,18 @@ export default function App() {
     return () => clearInterval(interval);
   }, [importOverlay]);
 
-  // Fetch models on mount
+  // Resolve the server's configured model before applying the discovered
+  // model list. Direct cloud models are intentionally omitted from
+  // /v1/models, so applying that list first can select a local fallback.
   useEffect(() => {
-    fetchModels()
-      .then((m) => {
-        setModels(m);
+    Promise.all([
+      fetchModels().catch(() => []),
+      fetchServerInfo().catch(() => null),
+    ])
+      .then(([models, info]) => {
+        initializeModels(models, info);
       })
-      .catch(() => setModels([]))
       .finally(() => setModelsLoading(false));
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Fetch server info
-  useEffect(() => {
-    fetchServerInfo().then(setServerInfo).catch(() => {});
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Poll savings and optionally share to Supabase

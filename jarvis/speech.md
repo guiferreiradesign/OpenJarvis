@@ -6,7 +6,7 @@ reasons or decides anything; JARVIS (the agent) stays the only "brain".
 | Role | Provider | Interface | Registry key | Settings |
 |---|---|---|---|---|
 | Speech input (audio → text) | MLX Whisper, `mlx-community/whisper-base-mlx` | upstream `SpeechBackend` (`openjarvis/speech/_stubs.py`) | `SpeechRegistry["mlx-whisper"]` | `[jarvis.speech_input]` |
-| Speech output (text → audio) | local Voicebox service, Kokoro engine, George voice | upstream `TTSBackend` (`openjarvis/speech/tts.py`) | `TTSRegistry["voicebox"]` | `[jarvis.speech_output]` |
+| Speech output (text → audio) | local VoiceStudio service, Kokoro George (`bm_george`) via MLX-Audio (D40; Voicebox replaced as the target, still registered as `voicebox` with `[jarvis.speech_output]`) | upstream `TTSBackend` (`openjarvis/speech/tts.py`) | `TTSRegistry["voicestudio"]` | `[jarvis.voicestudio]` |
 
 Code: `src/jarvis_ext/speech/` (`mlx_whisper.py`, `voicebox.py`,
 `audio.py`, `settings.py`, `errors.py`). Decisions: DECISIONS.md D34–D37.

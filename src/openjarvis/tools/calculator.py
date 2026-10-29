@@ -89,26 +89,37 @@ def _safe_eval_node(node: ast.AST) -> Any:
     raise ValueError(f"Unsupported expression type: {type(node).__name__}")
 
 
+def _python_eval(expression: str) -> float:
+    import ast as _ast
+
+    # Support ^ as the power operator (common math/calculator notation).
+    expression = expression.replace("^", "**")
+    try:
+        tree = _ast.parse(expression, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"Syntax error in expression: {exc}") from exc
+    try:
+        return float(_safe_eval_node(tree.body))
+    except ZeroDivisionError:
+        return math.inf
+
+
 def safe_eval(expression: str) -> float:
     """Evaluate a math expression safely — Rust backend with Python fallback."""
     try:
         from openjarvis._rust_bridge import get_rust_module
 
         _rust = get_rust_module()
-        return float(_rust.CalculatorTool().execute(expression))
+        output = _rust.CalculatorTool().execute(expression)
     except ImportError:
-        import ast as _ast
-
-        # Support ^ as the power operator (common math/calculator notation).
-        expression = expression.replace("^", "**")
-        try:
-            tree = _ast.parse(expression, mode="eval")
-        except SyntaxError as exc:
-            raise ValueError(f"Syntax error in expression: {exc}") from exc
-        try:
-            return float(_safe_eval_node(tree.body))
-        except ZeroDivisionError:
-            return math.inf
+        return _python_eval(expression)
+    try:
+        return float(output)
+    except ValueError:
+        # The Rust tool reports errors as text ("Error evaluating ..."), not as
+        # an exception. Re-evaluate in Python so the caller gets the real,
+        # specific error instead of "could not convert string to float".
+        return _python_eval(expression)
 
 
 @ToolRegistry.register("calculator")

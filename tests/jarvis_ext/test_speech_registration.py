@@ -11,6 +11,7 @@ import jarvis_ext
 from jarvis_ext.speech import STT_BACKEND_ID, TTS_BACKEND_ID
 from jarvis_ext.speech.mlx_whisper import MlxWhisperBackend
 from jarvis_ext.speech.voicebox import VoiceboxTTSBackend
+from jarvis_ext.speech.voicestudio import VoiceStudioTTSBackend
 from jarvis_ext.tools.media_jobs import QUEUE_CAPABILITIES, STATUS_CAPABILITIES
 from openjarvis.core.registry import SpeechRegistry, ToolRegistry, TTSRegistry
 
@@ -31,7 +32,10 @@ class TestRegistration:
         assert SpeechRegistry.contains(STT_BACKEND_ID)
         assert TTSRegistry.contains(TTS_BACKEND_ID)
         assert isinstance(SpeechRegistry.get(STT_BACKEND_ID)(), MlxWhisperBackend)
-        assert isinstance(TTSRegistry.get(TTS_BACKEND_ID)(), VoiceboxTTSBackend)
+        assert TTS_BACKEND_ID == "voicestudio"
+        assert isinstance(TTSRegistry.get(TTS_BACKEND_ID)(), VoiceStudioTTSBackend)
+        # The earlier Voicebox provider stays available but is not the default.
+        assert isinstance(TTSRegistry.get("voicebox")(), VoiceboxTTSBackend)
 
     def test_no_new_tools_and_unchanged_permissions(self):
         jarvis_ext.ensure_registered()

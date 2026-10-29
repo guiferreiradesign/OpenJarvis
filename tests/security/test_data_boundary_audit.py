@@ -40,7 +40,13 @@ EXPECTED_GENERIC_NETWORK_TOOLS = {"http_request"}
 EXPECTED_WEATHER_TOOLS = {"get_weather"}
 EXPECTED_MARKET_DATA_TOOLS = {"fx_macro_data"}
 EXPECTED_CHANNEL_OUTBOUND_TOOLS = {"channel_send"}
-EXPECTED_CONNECTOR_NETWORK_TOOLS = {"digest_collect", "execute_pending_actions"}
+EXPECTED_CONNECTOR_NETWORK_TOOLS = {
+    "digest_collect",
+    "execute_pending_actions",
+    "gmail_search_emails",
+    "gmail_get_thread",
+    "gmail_create_draft",
+}
 EXPECTED_CLOUD_MEDIA_TOOLS = {
     "audio_transcribe",
     "image_generate",
@@ -57,6 +63,7 @@ EXPECTED_LOCAL_ACCESS_TOOLS = {
     "docker_shell_exec",
     "db_query",
     "get_pending_actions",
+    "gmail_request_send_approval",
     "knowledge_search",
     "knowledge_sql",
     "memory_manage",
@@ -776,6 +783,9 @@ def test_required_registered_tool_names_are_classified():
     [
         ("digest_collect", "configured connector services"),
         ("execute_pending_actions", "Gmail, Google Calendar, or iMessage"),
+        ("gmail_search_emails", "configured AI model"),
+        ("gmail_get_thread", "configured AI model"),
+        ("gmail_create_draft", "the draft is not sent"),
     ],
 )
 def test_registered_connector_tools_warn_without_channel_or_digest_automation(

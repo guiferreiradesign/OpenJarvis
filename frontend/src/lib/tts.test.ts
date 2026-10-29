@@ -6,7 +6,7 @@ vi.mock('./api', () => ({
 }));
 
 import { synthesizeSpeech, fetchTtsHealth } from './api';
-import { useTtsStore, __resetTtsForTests, shouldAutoplayFinishedReply } from './tts';
+import { useTtsStore, __resetTtsForTests, shouldAutoplayFinishedReply, isStreamNotice } from './tts';
 
 const synth = vi.mocked(synthesizeSpeech);
 const health = vi.mocked(fetchTtsHealth);
@@ -161,6 +161,30 @@ describe('shared voice output', () => {
     expect(useTtsStore.getState().state).toBe('idle');
   });
 
+  it('reports empty audio without playing it', async () => {
+    synth.mockResolvedValue(new Blob([]));
+
+    await useTtsStore.getState().speak('m1', 'Hallo');
+
+    expect(FakeAudio.instances).toHaveLength(0);
+    expect(useTtsStore.getState().state).toBe('idle');
+    expect(useTtsStore.getState().error).toMatch(/empty audio/);
+    expect(useTtsStore.getState().errorId).toBe('m1');
+  });
+
+  it('explains a browser autoplay block and releases the audio', async () => {
+    synth.mockResolvedValue(new Blob(['wav']));
+    vi.spyOn(FakeAudio.prototype, 'play').mockRejectedValueOnce(
+      new DOMException('blocked', 'NotAllowedError'),
+    );
+
+    await useTtsStore.getState().speak('m1', 'Hallo');
+
+    expect(useTtsStore.getState().state).toBe('idle');
+    expect(useTtsStore.getState().error).toMatch(/blocked audio playback/);
+    expect(revoked).toContain(created[0]);
+  });
+
   it('ignores empty text', async () => {
     await useTtsStore.getState().speak('m1', '   ');
     expect(synth).not.toHaveBeenCalled();
@@ -250,5 +274,20 @@ describe('autoplay gating', () => {
     expect(
       shouldAutoplayFinishedReply('chat-1', 'chat-2', true, { role: 'assistant', id: 'old' }, null),
     ).toBe(false);
+  });
+});
+
+describe('autoplay skips stream notices', () => {
+  it.each([
+    'Error: network down',
+    '(Generation stopped)',
+    'This request timed out after 3 minutes. Please try again.',
+    'No response was generated. Please try again.',
+  ])('treats %s as a notice', (text) => {
+    expect(isStreamNotice(text)).toBe(true);
+  });
+
+  it('lets a normal reply through', () => {
+    expect(isStreamNotice('The error rate fell to 2%.')).toBe(false);
   });
 });

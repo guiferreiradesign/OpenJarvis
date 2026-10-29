@@ -203,7 +203,9 @@ def create_connectors_router():
         # client_id:client_secret pair through this path, so any
         # colon-containing string is enough to route here.
         is_google_pair = ".apps.googleusercontent.com" in raw
-        is_non_google_pair = provider is not None and provider.name != "google"
+        is_non_google_pair = provider is not None and not provider.name.startswith(
+            "google"
+        )
         if ":" not in raw or not (is_google_pair or is_non_google_pair):
             return None
 

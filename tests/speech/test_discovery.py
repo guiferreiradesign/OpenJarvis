@@ -56,20 +56,16 @@ def test_auto_discovery_skips_unhealthy_backend() -> None:
     config.speech.backend = "auto"
     unhealthy = MagicMock(backend_id="faster-whisper")
     unhealthy.health.return_value = False
-    healthy = MagicMock(backend_id="openai")
-    healthy.health.return_value = True
 
     with patch(
         "openjarvis.speech._discovery._create_backend",
-        side_effect=[unhealthy, healthy],
+        side_effect=[unhealthy],
     ) as create:
         result = get_speech_backend(config)
 
-    assert result is healthy
-    assert create.call_args_list == [
-        call("faster-whisper", config),
-        call("openai", config),
-    ]
+    # Unhealthy local backend: unavailable, and no cloud backend is even built.
+    assert result is None
+    assert create.call_args_list == [call("faster-whisper", config)]
 
 
 def test_auto_discovery_continues_when_health_check_raises() -> None:
@@ -79,14 +75,13 @@ def test_auto_discovery_continues_when_health_check_raises() -> None:
     config.speech.backend = "auto"
     broken = MagicMock(backend_id="faster-whisper")
     broken.health.side_effect = RuntimeError("model cannot load")
-    healthy = MagicMock(backend_id="openai")
-    healthy.health.return_value = True
 
     with patch(
         "openjarvis.speech._discovery._create_backend",
-        side_effect=[broken, healthy],
-    ):
-        assert get_speech_backend(config) is healthy
+        side_effect=[broken],
+    ) as create:
+        assert get_speech_backend(config) is None
+    assert create.call_count == 1
 
 
 def test_explicit_unhealthy_backend_is_unavailable() -> None:

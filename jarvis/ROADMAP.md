@@ -148,6 +148,10 @@ Delivered:
   ≈ 2.5 s, first transcription ≈ 0.5 s, then ≈ 0.21 s for 16.8 s of
   speech; Voicebox ≈ 2.4 s per sentence once warm.
 
+Update 2026-10-29 (D40): speech output now targets VoiceStudio with Kokoro
+George (`VoiceStudioTTSBackend`, `[jarvis.voicestudio]`); see
+[voicestudio-plan.md](voicestudio-plan.md).
+
 Not chosen: Whisper Large-v3-Turbo (memory pressure on 8 GB) and Voicebox's
 own transcription (≈ 3–4 s versus ≈ 0.2 s).
 
@@ -155,6 +159,39 @@ Dependency (approved, D37): optional `speech-mlx` extra,
 `mlx-whisper==0.4.3` for Apple Silicon only, sharing the locked mlx
 0.31.2 with `inference-mlx`. Install with `uv sync --extra dev --extra
 speech-mlx`; the model weights download separately on first use.
+
+## Voice and local-first track (current order of work)
+
+Status note: this file's "Next milestone" section below was written before
+the interface work. The branch `jarvis/phase-4.2-interface` already has
+commits "Build Phase 4.2 JARVIS interface" and "Fix cloud provider tool-call
+normalization", and `frontend/src/lib/tts.ts` plus `/v1/speech/synthesize`
+already give one-utterance read-aloud. Those sections and the README
+capability table have not been brought up to date; do that when the interface
+is next documented. Nothing below depends on it.
+
+Principles: the brain may be a hosted API (configured, switchable, never
+required to be local); listening, wake word and speech generation are local
+and are never permanent cloud services; Ollama is not a prerequisite and is
+never started automatically; nothing records or streams audio to a cloud
+service in the background.
+
+**Done: preflight foundation.** `python -m jarvis_ext preflight` and the
+verification rule ([preflight.md](preflight.md), D38). Every step below
+replaces its `WARN: NOT IMPLEMENTED` placeholder in
+`preflight/checks/future.py` with real checks in the same change.
+
+| Order | Step | Status | Done when (verified by) |
+|---|---|---|---|
+| 1 | VoiceStudio speech output: voice adapter, profiles, audio cache, sentence chunking, interruption, graceful failure ([voicestudio-plan.md](voicestudio-plan.md)) | **In progress:** adapter done 2026-10-29 (VoiceStudio, Kokoro George `bm_george`, British English, sent on every request; D40). Profiles, cache, chunking, streaming and interruption still planned | Unit tests with a fake service, `future.voice_adapter` and `future.speech_output` pass, JARVIS answers in text with the service stopped, no cloud TTS key is consulted |
+| 2 | Local Whisper in the voice loop (MLX Whisper provider exists; the loop does not) | Planned | Model loaded once, transcript reaches the agent, measured latency inside a budget, no audio leaves the machine |
+| 3 | Wake word, push-to-talk and interruption | Planned | Push-to-talk first; wake word only if it runs fully offline; speaking stops when the user talks or presses a key |
+| 4 | Persistent Markdown notes with immediate indexing | Planned | A note written is found by search in the same session without a restart |
+| 5 | Explicit local/cloud brain switching with a visible indicator | Planned | The active brain is always shown; switching is a user action, never automatic; the preflight `brain.*` checks cover both |
+| 6 | Local-mode privacy verification and network auditing | Planned | In local mode a network guard shows no outbound traffic except loopback; the check fails if any appears |
+
+Constraints for all steps: no Ollama auto-start, no always-on cloud audio,
+no secrets in logs/frontend/docs, no paid or quota-consuming calls to test.
 
 ## Next milestone: JARVIS First Usable Interface — Web, Text and Voice
 

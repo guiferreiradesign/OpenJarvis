@@ -233,6 +233,7 @@ class TestGetEngine:
 
         cfg = JarvisConfig()
         cfg.engine.default = "bad-local"
+        cfg.engine.allow_cross_boundary_fallback = True
 
         def _make(k, c):  # noqa: ANN001
             if k == "bad-local":
@@ -416,3 +417,64 @@ class TestMiningSidecarEngineHandoff:
             discover_engines(cfg)
 
         assert not EngineRegistry.contains("vllm-pearl-mining")
+
+
+class TestNoSilentBoundaryCrossing:
+    """A down local brain must never silently become a cloud one (or reverse)."""
+
+    @staticmethod
+    def _setup(default_is_cloud: bool):
+        class _Cloud(_FakeEngine):
+            is_cloud = True
+
+        _reg("def-engine", "def-engine")
+        _reg("other-engine", "other-engine")
+
+        def _make(k, c):  # noqa: ANN001
+            if k == "def-engine":
+                return (_Cloud if default_is_cloud else _FakeEngine)(healthy=False)
+            return (_FakeEngine if default_is_cloud else _Cloud)(healthy=True)
+
+        return _make
+
+    def test_local_down_does_not_pick_cloud_by_default(self, caplog) -> None:
+        cfg = JarvisConfig()
+        cfg.engine.default = "def-engine"
+        with mock.patch(
+            "openjarvis.engine._discovery._make_engine",
+            side_effect=self._setup(False),
+        ):
+            assert get_engine(cfg) is None
+        assert "not crossing the local/cloud boundary" in caplog.text
+
+    def test_cloud_down_does_not_pick_local_by_default(self) -> None:
+        cfg = JarvisConfig()
+        cfg.engine.default = "def-engine"
+        with mock.patch(
+            "openjarvis.engine._discovery._make_engine",
+            side_effect=self._setup(True),
+        ):
+            assert get_engine(cfg) is None
+
+    def test_opt_in_allows_crossing(self) -> None:
+        cfg = JarvisConfig()
+        cfg.engine.default = "def-engine"
+        cfg.engine.allow_cross_boundary_fallback = True
+        with mock.patch(
+            "openjarvis.engine._discovery._make_engine",
+            side_effect=self._setup(False),
+        ):
+            result = get_engine(cfg)
+        assert result is not None and result[0] == "other-engine"
+
+    def test_default_flag_is_off(self) -> None:
+        assert JarvisConfig().engine.allow_cross_boundary_fallback is False
+
+    def test_explicit_engine_is_never_substituted(self) -> None:
+        cfg = JarvisConfig()
+        cfg.engine.allow_cross_boundary_fallback = True
+        with mock.patch(
+            "openjarvis.engine._discovery._make_engine",
+            side_effect=self._setup(False),
+        ):
+            assert get_engine(cfg, engine_key="def-engine") is None

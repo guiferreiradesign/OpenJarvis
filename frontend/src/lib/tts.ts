@@ -52,6 +52,21 @@ export function shouldAutoplayFinishedReply(
     && lastMessage.id !== autoSpokenId;
 }
 
+/**
+ * Placeholder text InputArea writes when a stream fails, is cancelled or yields
+ * nothing. It is shown as the reply, but reading a failure aloud on its own
+ * would be noise, so autoplay skips it (the Speak button still works).
+ */
+export function isStreamNotice(content: string): boolean {
+  const t = content.trim();
+  return (
+    t.startsWith('Error:')
+    || t === '(Generation stopped)'
+    || t.startsWith('This request timed out')
+    || t.startsWith('No response was generated')
+  );
+}
+
 function teardown(): void {
   if (audio) {
     // Detach first: clearing src re-runs the media load algorithm, which fails
@@ -115,6 +130,7 @@ export const useTtsStore = create<TtsStore>((set, get) => ({
     try {
       const blob = await synthesizeSpeech(trimmed, { signal: ac.signal });
       if (mine !== token) return;
+      if (blob.size === 0) throw new Error('Speech synthesis returned empty audio');
 
       const url = URL.createObjectURL(blob);
       objectUrl = url;
@@ -141,7 +157,12 @@ export const useTtsStore = create<TtsStore>((set, get) => ({
       set({
         state: 'idle',
         speakingId: null,
-        error: err instanceof Error ? err.message : 'Speech synthesis failed',
+        error:
+          err instanceof DOMException && err.name === 'NotAllowedError'
+            ? 'Your browser blocked audio playback. Click Speak again.'
+            : err instanceof Error
+              ? err.message
+              : 'Speech synthesis failed',
         errorId: id,
       });
     }

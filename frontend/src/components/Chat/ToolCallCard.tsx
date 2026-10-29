@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ChevronDown, ChevronRight, Loader2, CheckCircle2, XCircle } from 'lucide-react';
 import type { ToolCallInfo } from '../../types';
 import { serializeToolCallArguments } from '../../lib/tool-call';
+import { cancelGmailSendApproval, confirmGmailSendApproval, fetchGmailSendApproval } from '../../lib/api';
 
 interface Props {
   toolCall: ToolCallInfo;
@@ -40,6 +41,7 @@ export function ToolCallCard({ toolCall }: Props) {
   // the TypeScript contract, so normalize again at the final render boundary.
   const argumentsText = serializeToolCallArguments(toolCall.arguments);
   const preview = previewArgs(argumentsText);
+  const approval = toolCall.tool === 'gmail_request_send_approval' ? parseApprovalId(toolCall.result) : null;
 
   return (
     <div
@@ -159,8 +161,69 @@ export function ToolCallCard({ toolCall }: Props) {
           )}
         </div>
       )}
+      {approval && <GmailApprovalPanel approvalId={approval} />}
     </div>
   );
+}
+
+function parseApprovalId(result?: string): string | null {
+  if (!result) return null;
+  try {
+    const parsed = JSON.parse(result);
+    return typeof parsed.approval_id === 'string' ? parsed.approval_id : null;
+  } catch { return null; }
+}
+
+function GmailApprovalPanel({ approvalId }: { approvalId: string }) {
+  const [approval, setApproval] = useState<any>(null);
+  const [approvalToken, setApprovalToken] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [result, setResult] = useState('');
+  useEffect(() => {
+    const token = sessionStorage.getItem(`openjarvis-gmail-approval:${approvalId}`) || '';
+    setApprovalToken(token);
+    if (!token) { setError('Dashboard approval token is unavailable. Request a new approval.'); return; }
+    let active = true;
+    fetchGmailSendApproval(approvalId, token)
+      .then((data) => {
+        if (active) { setApproval(data); if (data.result?.message_id) setResult(`Sent successfully. Gmail message ID: ${data.result.message_id}`); }
+      }).catch((e) => { if (active) setError(e.message); });
+    return () => { active = false; };
+  }, [approvalId]);
+  const act = async (action: 'confirm' | 'cancel') => {
+    setBusy(true); setError('');
+    try {
+      const data = action === 'cancel'
+        ? await cancelGmailSendApproval(approvalId, approvalToken)
+        : await confirmGmailSendApproval(approvalId, approvalToken);
+      if (action === 'cancel') { setApproval((old: any) => ({ ...old, status: 'cancelled' })); setResult('Email cancelled.'); }
+      else { setApproval((old: any) => ({ ...old, status: data.status })); setResult(data.message_id ? `Sent successfully. Gmail message ID: ${data.message_id}` : 'Gmail accepted the message.'); }
+    } catch (e: any) {
+      setError(e.message || 'Request failed.');
+      try {
+        const fresh = await fetchGmailSendApproval(approvalId, approvalToken);
+        setApproval(fresh);
+        if (fresh.result?.message_id) setResult(`Sent successfully. Gmail message ID: ${fresh.result.message_id}`);
+      } catch { /* Preserve the actionable error returned by the send endpoint. */ }
+    }
+    finally { setBusy(false); }
+  };
+  const m = approval?.message;
+  return <section className="m-3 rounded-lg p-4 text-sm" style={{ border: '1px solid var(--color-warning, #d99a2b)', background: 'var(--color-bg-secondary)' }} aria-label="Gmail send approval">
+    <strong>Review email before sending</strong>
+    {m && <div className="mt-3 space-y-2" style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+      <div><b>Recipient:</b> {m.to}</div><div><b>Subject:</b> {m.subject}</div><div><b>Body:</b><div className="mt-1">{m.body}</div></div>
+    </div>}
+    <p className="mt-3">Confirming will send this exact message through Gmail.</p>
+    {error && <p role="alert" className="mt-2" style={{ color: 'var(--color-error)' }}>{error}</p>}
+    {result && <p role="status" className="mt-2">{result}</p>}
+    {approval?.status === 'pending' && <div className="mt-3 flex gap-2">
+      <button disabled={busy || !m} onClick={() => void act('confirm')} className="rounded px-3 py-2" style={{ background: 'var(--color-accent)', color: 'white' }}>{busy ? 'Working…' : 'Confirm & Send'}</button>
+      <button disabled={busy} onClick={() => void act('cancel')} className="rounded px-3 py-2">Cancel</button>
+    </div>}
+    {approval && approval.status !== 'pending' && !result && <p className="mt-2">Approval status: {approval.status}.</p>}
+  </section>;
 }
 
 function formatJson(raw: string): string {

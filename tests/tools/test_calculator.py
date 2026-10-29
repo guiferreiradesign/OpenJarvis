@@ -110,3 +110,22 @@ class TestCalculatorTool:
         fn = tool.to_openai_function()
         assert fn["function"]["name"] == "calculator"
         assert "expression" in fn["function"]["parameters"]["properties"]
+
+
+def test_rust_error_text_is_not_reported_as_a_float_conversion_error(monkeypatch):
+    """A Rust-reported error string must not surface as 'could not convert'."""
+    from types import SimpleNamespace
+
+    import openjarvis._rust_bridge as bridge
+    from openjarvis.tools.calculator import CalculatorTool
+
+    rust = SimpleNamespace(
+        CalculatorTool=lambda: SimpleNamespace(
+            execute=lambda expression: "Error evaluating 'foo(1)': Unknown function"
+        )
+    )
+    monkeypatch.setattr(bridge, "get_rust_module", lambda: rust)
+    result = CalculatorTool().execute(expression="foo(1)")
+    assert result.success is False
+    assert "could not convert" not in result.content
+    assert "Unknown function: foo" in result.content

@@ -209,6 +209,7 @@ interface AppState {
 
   // Actions: models & server
   setModels: (models: ModelInfo[]) => void;
+  initializeModels: (models: ModelInfo[], serverInfo: ServerInfo | null) => void;
   setModelsLoading: (loading: boolean) => void;
   setSelectedModel: (model: string) => void;
   setServerInfo: (info: ServerInfo | null) => void;
@@ -489,6 +490,7 @@ export const useAppStore = create<AppState>((set, get) => {
         // chat". Prefer a real chat model for selection / fallback.
         const chatModels = models.filter((m) => !isEmbedOnlyModel(m.id));
         const preferred =
+          state.serverInfo?.model ||
           (state.settings.defaultModel &&
             chatModels.some((m) => m.id === state.settings.defaultModel) &&
             state.settings.defaultModel) ||
@@ -500,6 +502,7 @@ export const useAppStore = create<AppState>((set, get) => {
           !!state.selectedModel && isEmbedOnlyModel(state.selectedModel);
         const currentMissing =
           !!state.selectedModel &&
+          state.selectedModel !== state.serverInfo?.model &&
           !models.some((m) => m.id === state.selectedModel);
 
         if (!state.selectedModel || currentIsBad || currentMissing) {
@@ -511,6 +514,32 @@ export const useAppStore = create<AppState>((set, get) => {
           };
         }
         return { models };
+      }),
+    initializeModels: (models, serverInfo) =>
+      set((state) => {
+        const chatModels = models.filter((m) => !isEmbedOnlyModel(m.id));
+        const preferred =
+          serverInfo?.model ||
+          (state.settings.defaultModel &&
+            chatModels.some((m) => m.id === state.settings.defaultModel) &&
+            state.settings.defaultModel) ||
+          chatModels[0]?.id ||
+          '';
+        const currentIsBad =
+          !!state.selectedModel && isEmbedOnlyModel(state.selectedModel);
+        const currentMissing =
+          !!state.selectedModel &&
+          state.selectedModel !== serverInfo?.model &&
+          !models.some((m) => m.id === state.selectedModel);
+
+        return {
+          models,
+          serverInfo,
+          selectedModel:
+            !state.selectedModel || currentIsBad || currentMissing
+              ? preferred
+              : state.selectedModel,
+        };
       }),
     setModelsLoading: (loading: boolean) => set({ modelsLoading: loading }),
     setSelectedModel: (model: string) => set({ selectedModel: model }),

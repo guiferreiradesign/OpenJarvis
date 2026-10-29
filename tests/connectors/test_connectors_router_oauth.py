@@ -46,7 +46,6 @@ _ALL_GOOGLE_FILES = (
     "gdrive.json",
     "gcalendar.json",
     "gcontacts.json",
-    "gmail.json",
     "google_tasks.json",
 )
 
@@ -161,9 +160,10 @@ def test_connect_client_pair_returns_oauth_required_no_browser(
     # No fire-and-forget browser thread (the root cause of "nothing happens").
     mock_browser.assert_not_called()
 
-    # Client credentials persisted to EVERY Google credential file so a single
-    # consent covers all Google connectors.
-    for filename in _ALL_GOOGLE_FILES:
+    # Gmail uses an isolated, least-privilege consent; other Google products
+    # continue to share their existing OAuth client credentials.
+    files = ("gmail.json",) if connector_id == "gmail" else _ALL_GOOGLE_FILES
+    for filename in files:
         path = hermetic_connectors / filename
         assert path.exists(), f"{filename} not written"
         assert json.loads(path.read_text())["client_id"] == _CLIENT_ID
@@ -317,10 +317,50 @@ def test_oauth_callback_exchanges_and_connects(
     from openjarvis.connectors.gdrive import GDriveConnector
 
     assert GDriveConnector().is_connected() is True
-
     listing = client.get("/v1/connectors").json()["connectors"]
     gdrive = next(c for c in listing if c["connector_id"] == "gdrive")
     assert gdrive["connected"] is True
+
+
+def test_gmail_uses_isolated_read_and_draft_oauth_scope():
+    from openjarvis.connectors.oauth import (
+        GOOGLE_ALL_SCOPES,
+        GOOGLE_GMAIL_SCOPES,
+        get_provider_for_connector,
+    )
+
+    gmail_provider = get_provider_for_connector("gmail")
+    google_provider = get_provider_for_connector("gdrive")
+    assert gmail_provider is not None
+    assert gmail_provider.name == "google_gmail"
+    assert gmail_provider.scopes == GOOGLE_GMAIL_SCOPES
+    assert "https://www.googleapis.com/auth/gmail.readonly" in gmail_provider.scopes
+    assert "https://www.googleapis.com/auth/gmail.compose" in gmail_provider.scopes
+    assert "https://www.googleapis.com/auth/gmail.modify" not in gmail_provider.scopes
+    assert google_provider is not None
+    assert "https://www.googleapis.com/auth/gmail.modify" not in GOOGLE_ALL_SCOPES
+    assert "gmail" not in google_provider.connector_ids
+    assert gmail_provider.credential_files == ("gmail.json",)
+
+
+def test_gmail_oauth_callback_stores_only_gmail_token(
+    client: TestClient, hermetic_connectors: Path
+) -> None:
+    import openjarvis.connectors.oauth as oauth_mod
+
+    client.post("/v1/connectors/gmail/connect", json={"code": _CLIENT_PAIR})
+    with patch.object(
+        oauth_mod,
+        "_exchange_token",
+        return_value={"access_token": "mock-access", "refresh_token": "mock-refresh"},
+    ):
+        response = client.get("/v1/connectors/gmail/oauth/callback?code=mock-code")
+
+    assert response.status_code == 200, response.text
+    saved = json.loads((hermetic_connectors / "gmail.json").read_text())
+    assert saved["access_token"] == "mock-access"
+    assert saved["refresh_token"] == "mock-refresh"
+    assert not (hermetic_connectors / "google.json").exists()
 
 
 def test_oauth_callback_error_param_renders_failure(client: TestClient) -> None:

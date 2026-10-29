@@ -560,6 +560,19 @@ export function SettingsPage() {
                 }}
               />
             </SettingRow>
+            <SettingRow
+              label="Data Sources"
+              description="Connect Gmail and other services"
+            >
+              <a
+                href="/data-sources"
+                className="flex items-center gap-1.5 text-xs font-medium"
+                style={{ color: 'var(--color-accent)' }}
+              >
+                <Database size={14} aria-hidden="true" />
+                Manage Data Sources
+              </a>
+            </SettingRow>
           </Section>
 
           {/* Inference source */}
@@ -784,7 +797,7 @@ export function SettingsPage() {
 
           {/* Speech */}
           <Section title="Speech">
-            <SettingRow label="Speech-to-Text" description="Enable microphone input for voice dictation">
+            <SettingRow label="Speech-to-Text" description="Click the microphone to dictate; recognised on this Mac, then review before sending">
               <button
                 onClick={() => { updateSettings({ speechEnabled: !settings.speechEnabled }); showSaved(); }}
                 className="relative w-11 h-6 rounded-full transition-colors cursor-pointer"
@@ -801,7 +814,7 @@ export function SettingsPage() {
                 />
               </button>
             </SettingRow>
-            <SettingRow label="Text-to-Speech" description="Show a read-aloud button on assistant replies">
+            <SettingRow label="Text-to-Speech" description="Enable voice output options. The Speak button on replies is always available">
               <button
                 onClick={() => { updateSettings({ voiceOutputEnabled: !settings.voiceOutputEnabled }); showSaved(); }}
                 className="relative w-11 h-6 rounded-full transition-colors cursor-pointer"
@@ -853,7 +866,7 @@ export function SettingsPage() {
                 </span>
               </div>
             </SettingRow>
-            <SettingRow label="Backend status" description="Requires Whisper, Deepgram, or another speech backend">
+            <SettingRow label="Backend status" description="Local speech recognition (MLX Whisper); audio never leaves this Mac">
               <div className="flex items-center gap-2">
                 <span
                   className="w-2 h-2 rounded-full"
@@ -872,7 +885,7 @@ export function SettingsPage() {
             </SettingRow>
             {!speechBackendAvailable && speechBackendAvailable !== null && (
               <div className="text-xs mt-2 px-1" style={{ color: 'var(--color-text-tertiary)' }}>
-                Set up a speech backend to use voice input.
+                Local speech recognition is not available. Nothing is sent to a cloud service.
                 See the <a href="https://open-jarvis.github.io/OpenJarvis/user-guide/tools/" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-accent)' }}>documentation</a> for details.
               </div>
             )}

@@ -241,6 +241,13 @@ DEFAULT_TOOL_CAPABILITIES: Dict[str, List[str]] = {
     "file_read": [Capability.FILE_READ],
     "file_write": [Capability.FILE_WRITE],
     "get_pending_actions": [Capability.MEMORY_READ],
+    # Live Gmail API reads; the content is returned to the calling model.
+    "gmail_search_emails": [Capability.NETWORK_FETCH],
+    "gmail_get_thread": [Capability.NETWORK_FETCH],
+    # Writes a draft to Gmail. Deliberately NOT channel:send: it never sends.
+    "gmail_create_draft": [Capability.NETWORK_FETCH],
+    # Local pending-approval record only: no network, no send.
+    "gmail_request_send_approval": [Capability.MEMORY_WRITE],
     "fx_macro_data": [Capability.NETWORK_FETCH],
     "get_weather": [Capability.NETWORK_FETCH],
     "git_commit": [Capability.FILE_WRITE],

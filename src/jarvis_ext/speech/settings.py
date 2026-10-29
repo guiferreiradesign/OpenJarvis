@@ -7,6 +7,7 @@
     language = "en"                          # "" lets Whisper detect it
     initial_prompt = "JARVIS, Voicebox, Kokoro, George, Phase 4.1 roadmap"
     max_audio_seconds = 120                  # longer recordings are refused
+    microphone = ""                          # name fragment or index; "" = built-in mic
 
     [jarvis.speech_output]                   # local Voicebox service
     base_url = "http://127.0.0.1:17493"      # loopback only
@@ -18,7 +19,17 @@
     connect_timeout_seconds = 2
     max_text_chars = 4000
 
-Both sections are optional; the defaults are the configuration chosen in
+    [jarvis.voicestudio]                     # local VoiceStudio service (JARVIS's voice)
+    base_url = "http://127.0.0.1:3900"       # loopback only
+    model = "mlx-audio"                      # MLX-Audio / Kokoro 82M
+    voice = "bm_george"                      # sent explicitly on every request
+    language = "British English"
+    speed = 1.0
+    timeout_seconds = 180                    # whole request; first one loads the model
+    connect_timeout_seconds = 2
+    max_text_chars = 4000
+
+All sections are optional; the defaults are the configuration chosen in
 Phase 4.1 (see jarvis/speech.md).  As elsewhere in ``jarvis_ext``, unknown
 keys and out-of-range values are errors rather than silently ignored.
 """
@@ -46,6 +57,14 @@ DEFAULT_VOICEBOX_URL = "http://127.0.0.1:17493"
 DEFAULT_TTS_ENGINE = "kokoro"
 DEFAULT_TTS_VOICE = "bm_george"
 DEFAULT_TTS_LANGUAGE = "en"
+
+DEFAULT_VOICESTUDIO_URL = "http://127.0.0.1:3900"
+DEFAULT_VOICESTUDIO_MODEL = "mlx-audio"
+DEFAULT_VOICESTUDIO_VOICE = "bm_george"
+DEFAULT_VOICESTUDIO_LANGUAGE = "British English"
+VOICESTUDIO_SECTION = "voicestudio"
+# VoiceStudio rejects `input` over 4096 characters.
+VOICESTUDIO_MAX_TEXT_CHARS = 4096
 
 # Whisper prompts are limited to about 224 tokens; this keeps well inside it.
 MAX_PROMPT_CHARS = 600
@@ -109,12 +128,15 @@ class SpeechInputSettings:
     language: Optional[str] = DEFAULT_STT_LANGUAGE  # None: auto-detect
     initial_prompt: Optional[str] = DEFAULT_INITIAL_PROMPT  # None: no prompt
     max_audio_seconds: float = 120.0
+    microphone: str = ""  # "": the first device named "microphone"
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "SpeechInputSettings":
         name = INPUT_SECTION
         _check_keys(
-            section, name, {"model", "language", "initial_prompt", "max_audio_seconds"}
+            section,
+            name,
+            {"model", "language", "initial_prompt", "max_audio_seconds", "microphone"},
         )
         model = _string(section, name, "model", DEFAULT_STT_MODEL)
         if not model:
@@ -138,6 +160,7 @@ class SpeechInputSettings:
             max_audio_seconds=_number(
                 section, name, "max_audio_seconds", (120.0, 1.0, 1800.0)
             ),
+            microphone=_string(section, name, "microphone", ""),
         )
 
     @classmethod
@@ -217,6 +240,83 @@ class SpeechOutputSettings:
         return cls.from_mapping(load_extension_section(OUTPUT_SECTION, config_path))
 
 
+@dataclass(frozen=True)
+class VoiceStudioSettings:
+    """Validated ``[jarvis.voicestudio]`` settings.
+
+    The defaults are the voice chosen for JARVIS: Kokoro 82M through
+    MLX-Audio, voice ``bm_george``, British English.  Model, voice and
+    language are sent on every request, never left to VoiceStudio's active
+    engine.
+    """
+
+    base_url: str = DEFAULT_VOICESTUDIO_URL
+    model: str = DEFAULT_VOICESTUDIO_MODEL
+    voice: str = DEFAULT_VOICESTUDIO_VOICE
+    language: str = DEFAULT_VOICESTUDIO_LANGUAGE
+    speed: float = 1.0
+    timeout_seconds: float = 180.0
+    connect_timeout_seconds: float = 2.0
+    max_text_chars: int = 4000
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "VoiceStudioSettings":
+        name = VOICESTUDIO_SECTION
+        _check_keys(
+            section,
+            name,
+            {
+                "base_url",
+                "model",
+                "voice",
+                "language",
+                "speed",
+                "timeout_seconds",
+                "connect_timeout_seconds",
+                "max_text_chars",
+            },
+        )
+        values = {}
+        for key, default in (
+            ("model", DEFAULT_VOICESTUDIO_MODEL),
+            ("voice", DEFAULT_VOICESTUDIO_VOICE),
+            ("language", DEFAULT_VOICESTUDIO_LANGUAGE),
+        ):
+            values[key] = _string(section, name, key, default)
+            if not values[key]:
+                raise ExtensionConfigError(f"{name}.{key} must not be empty")
+        max_chars = section.get("max_text_chars", 4000)
+        if (
+            isinstance(max_chars, bool)
+            or not isinstance(max_chars, int)
+            or not 1 <= max_chars <= VOICESTUDIO_MAX_TEXT_CHARS
+        ):
+            raise ExtensionConfigError(
+                f"{name}.max_text_chars must be an integer between 1 and "
+                f"{VOICESTUDIO_MAX_TEXT_CHARS}"
+            )
+        return cls(
+            base_url=validate_local_url(
+                _string(section, name, "base_url", DEFAULT_VOICESTUDIO_URL), name
+            ),
+            speed=_number(section, name, "speed", (1.0, 0.25, 4.0)),
+            timeout_seconds=_number(
+                section, name, "timeout_seconds", (180.0, 1.0, 1200.0)
+            ),
+            connect_timeout_seconds=_number(
+                section, name, "connect_timeout_seconds", (2.0, 0.1, 30.0)
+            ),
+            max_text_chars=max_chars,
+            **values,
+        )
+
+    @classmethod
+    def load(cls, config_path: Optional[Path] = None) -> "VoiceStudioSettings":
+        return cls.from_mapping(
+            load_extension_section(VOICESTUDIO_SECTION, config_path)
+        )
+
+
 def validate_local_url(raw: str, section: str = OUTPUT_SECTION) -> str:
     """Return *raw* without a trailing slash if it is a plain loopback HTTP URL.
 
@@ -259,6 +359,12 @@ __all__ = [
     "DEFAULT_TTS_ENGINE",
     "DEFAULT_TTS_VOICE",
     "DEFAULT_VOICEBOX_URL",
+    "DEFAULT_VOICESTUDIO_LANGUAGE",
+    "DEFAULT_VOICESTUDIO_MODEL",
+    "DEFAULT_VOICESTUDIO_URL",
+    "DEFAULT_VOICESTUDIO_VOICE",
+    "VOICESTUDIO_SECTION",
+    "VoiceStudioSettings",
     "INPUT_SECTION",
     "OUTPUT_SECTION",
     "SpeechInputSettings",

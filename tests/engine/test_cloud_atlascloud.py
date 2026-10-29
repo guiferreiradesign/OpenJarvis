@@ -333,12 +333,9 @@ class TestAtlasCloudGenerate:
             [Message(role=Role.USER, content="Hi")], model=_DEFAULT_MODEL
         )
 
+        # Flat shape, as the orchestrator consumes it (commit 13dab098).
         assert result["tool_calls"] == [
-            {
-                "id": "call_1",
-                "type": "function",
-                "function": {"name": "search", "arguments": '{"q":"x"}'},
-            }
+            {"id": "call_1", "name": "search", "arguments": '{"q":"x"}'}
         ]
 
 

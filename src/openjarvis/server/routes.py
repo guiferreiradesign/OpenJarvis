@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import uuid
@@ -13,6 +14,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from openjarvis.core.events import EventType
 from openjarvis.core.paths import get_config_dir
 from openjarvis.core.types import Message, Role, ToolCall
 from openjarvis.server.model_capabilities import is_embed_only_model
@@ -306,6 +308,7 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 trace_store=getattr(request.app.state, "trace_store", None),
                 bus=getattr(request.app.state, "bus", None),
                 memory_service=getattr(request.app.state, "memory_service", None),
+                dashboard_session_id=request.headers.get("X-OpenJarvis-Chat-Session", ""),
             )
         return await _handle_stream(
             engine,
@@ -680,6 +683,7 @@ async def _handle_agent_stream(
     trace_store=None,
     bus=None,
     memory_service=None,
+    dashboard_session_id: str = "",
 ):
     """Run the configured agent and return its result as an SSE response.
 
@@ -700,6 +704,48 @@ async def _handle_agent_stream(
             break
 
     async def generate():
+        done_sentinel = object()
+        event_queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        subscriptions = {}
+        agent_event_id = getattr(agent, "agent_id", None)
+
+        def _forward_tool_event(event):
+            data = event.data or {}
+            forwarded_event = event
+            if agent_event_id and data.get("agent") != agent_event_id:
+                return
+            if data.get("tool") == "gmail_request_send_approval":
+                try:
+                    from openjarvis.server.gmail_approval import store as approval_store
+                    from openjarvis.tools.gmail_tools import _account_binding, _approval_owner
+                    from openjarvis.connectors.gmail import GmailConnector
+                    approval_id = (data.get("metadata") or {}).get("gmail_approval_id")
+                    if not isinstance(approval_id, str) and data.get("result"):
+                        result = json.loads(data["result"])
+                        approval_id = result.get("approval_id")
+                    if isinstance(approval_id, str):
+                        dashboard_token = approval_store.dashboard_token(
+                            approval_id, _approval_owner(), _account_binding(
+                                GmailConnector()
+                            )
+                        )
+                        if dashboard_token:
+                            data = dict(data)
+                            data["dashboard_token"] = dashboard_token
+                            from dataclasses import replace
+                            forwarded_event = replace(event, data=data)
+                except Exception:
+                    logging.getLogger("openjarvis.server").debug(
+                        "Could not attach Gmail approval token to dashboard event",
+                        exc_info=True,
+                    )
+            try:
+                loop.call_soon_threadsafe(event_queue.put_nowait, forwarded_event)
+            except RuntimeError:
+                # The client disconnected and the response loop has closed.
+                pass
+
         first_chunk = ChatCompletionChunk(
             id=chunk_id,
             model=model,
@@ -707,8 +753,15 @@ async def _handle_agent_stream(
         )
         yield f"data: {first_chunk.model_dump_json()}\n\n"
 
-        try:
-            response = await asyncio.to_thread(
+        if bus is not None:
+            for event_type in (EventType.TOOL_CALL_START, EventType.TOOL_CALL_END):
+                subscriptions[event_type] = _forward_tool_event
+                bus.subscribe(event_type, _forward_tool_event)
+
+        from openjarvis.server.gmail_approval import current_dashboard_session
+        session_token = current_dashboard_session.set(dashboard_session_id)
+        agent_task = asyncio.create_task(
+            asyncio.to_thread(
                 _handle_agent,
                 agent,
                 model,
@@ -717,6 +770,38 @@ async def _handle_agent_stream(
                 trace_store=trace_store,
                 bus=bus,
             )
+        )
+        current_dashboard_session.reset(session_token)
+
+        def _agent_done(_task):
+            try:
+                loop.call_soon_threadsafe(event_queue.put_nowait, done_sentinel)
+            except RuntimeError:
+                pass
+
+        agent_task.add_done_callback(_agent_done)
+
+        try:
+            while True:
+                event = await event_queue.get()
+                if event is done_sentinel:
+                    break
+
+                event_name = event.event_type.value
+                event_data = event.data or {}
+                if (
+                    event.event_type == EventType.TOOL_CALL_START
+                    and not isinstance(event_data.get("arguments"), str)
+                ):
+                    # ToolExecutor publishes parsed arguments; the existing
+                    # dashboard SSE contract represents them as JSON text.
+                    event_data = dict(event_data)
+                    event_data["arguments"] = json.dumps(
+                        event_data.get("arguments")
+                    )
+                yield f"event: {event_name}\ndata: {json.dumps(event_data)}\n\n"
+
+            response = agent_task.result()
         except Exception as exc:
             logging.getLogger("openjarvis.server").error(
                 "Agent stream error: %s",
@@ -738,6 +823,11 @@ async def _handle_agent_stream(
             yield f"data: {error_chunk.model_dump_json()}\n\n"
             yield "data: [DONE]\n\n"
             return
+        finally:
+            if not agent_task.done():
+                agent_task.cancel()
+            for event_type, callback in subscriptions.items():
+                bus.unsubscribe(event_type, callback)
 
         content = _response_content(response)
         if content:
@@ -1259,6 +1349,11 @@ async def reload_cloud_engine(request: Request):
         from openjarvis.engine.multi import MultiEngine
 
         cloud = CloudEngine()
+        _config = getattr(request.app.state, "config", None)
+        if _config is not None:
+            from openjarvis.engine._discovery import apply_openrouter_policy
+
+            apply_openrouter_policy(cloud, _config)
         if not cloud.health():
             return {
                 "status": "no_cloud",

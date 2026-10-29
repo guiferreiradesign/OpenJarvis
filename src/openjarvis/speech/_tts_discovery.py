@@ -18,10 +18,17 @@ logger = logging.getLogger(__name__)
 # Priority order: local first, then cloud.
 TTS_BACKEND_ORDER = ("kokoro", "openai_tts", "cartesia", "elevenlabs")
 
+# Backends that send the reply text to a third party. A cloud backend counts as
+# healthy as soon as its API key exists, so these are never reached by
+# *fallback* unless ``allow_cloud`` is set; naming one as ``preferred`` is the
+# explicit opt-in.
+CLOUD_TTS_BACKENDS = frozenset({"openai_tts", "cartesia", "elevenlabs"})
+
 # Voice IDs are backend-specific and NOT portable. ``speech.voice_id`` applies
 # only to ``speech.tts_backend``; if synthesis falls back to another backend we
 # use that backend's own default rather than passing an unrecognized ID through.
 BACKEND_DEFAULT_VOICE = {
+    "voicestudio": "bm_george",  # Kokoro 82M via VoiceStudio (MLX-Audio)
     "kokoro": "bm_george",  # British male
     "openai_tts": "onyx",  # deepest OpenAI preset
     "cartesia": "",  # no safe static default; let Cartesia choose
@@ -38,11 +45,15 @@ def get_tts_backend(
     preferred: str = "",
     *,
     attempted: Optional[set[str]] = None,
+    allow_cloud: bool = False,
 ) -> Optional[Any]:
     """Return the first healthy TTS backend, preferring *preferred*.
 
     ``attempted`` lets a caller carry state across calls so a backend that
     already failed is not retried; it is mutated in place.
+
+    A cloud backend is skipped unless it is *preferred* or ``allow_cloud`` is
+    true, so a down local service never silently sends text to a provider.
     """
     # Import triggers built-in backend registration only when voice output is
     # actually requested.
@@ -53,6 +64,8 @@ def get_tts_backend(
 
     for key in dict.fromkeys((preferred, *TTS_BACKEND_ORDER)):
         if not key or key in seen:
+            continue
+        if key in CLOUD_TTS_BACKENDS and key != preferred and not allow_cloud:
             continue
         seen.add(key)
         if not TTSRegistry.contains(key):
@@ -71,7 +84,7 @@ def voice_preferences(config: "JarvisConfig") -> tuple[str, str, float]:
     """Resolve ``(tts_backend, voice_id, speed)`` from *config*."""
     speech = getattr(config, "speech", None)
     return (
-        getattr(speech, "tts_backend", "kokoro") or "kokoro",
+        getattr(speech, "tts_backend", "voicestudio") or "voicestudio",
         getattr(speech, "voice_id", "") or "",
         float(getattr(speech, "voice_speed", 1.0)),
     )
@@ -79,6 +92,7 @@ def voice_preferences(config: "JarvisConfig") -> tuple[str, str, float]:
 
 __all__ = [
     "BACKEND_DEFAULT_VOICE",
+    "CLOUD_TTS_BACKENDS",
     "TTS_BACKEND_ORDER",
     "default_voice_for",
     "get_tts_backend",

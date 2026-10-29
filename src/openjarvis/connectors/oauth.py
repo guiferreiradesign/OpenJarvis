@@ -52,8 +52,15 @@ class OAuthProvider:
     credential_files: Tuple[str, ...] = ()
 
 
-# Combined scopes for all Google connectors so a single OAuth consent
-# authorises Drive, Calendar, Contacts, Gmail, and Tasks at once.
+# Gmail draft creation needs gmail.compose, which also permits sending at the
+# Gmail API level. OpenJarvis exposes no send tool; this remains a provider
+# scope limitation rather than an application capability.
+GOOGLE_GMAIL_SCOPES: List[str] = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.compose",
+]
+
+# Combined scopes for the non-Gmail Google connectors.
 GOOGLE_ALL_SCOPES: List[str] = [
     "openid",
     "email",
@@ -62,9 +69,6 @@ GOOGLE_ALL_SCOPES: List[str] = [
     # calendar (not .readonly) so the proactive agent can accept/decline events.
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/contacts.readonly",
-    # gmail.modify (a superset of gmail.readonly) so the proactive agent
-    # can trash and label-modify (archive) emails after user approval.
-    "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/tasks.readonly",
 ]
 
@@ -82,7 +86,6 @@ OAUTH_PROVIDERS: Dict[str, OAuthProvider] = {
             "gdrive",
             "gcalendar",
             "gcontacts",
-            "gmail",
             "google_tasks",
         ),
         credential_files=(
@@ -90,9 +93,20 @@ OAUTH_PROVIDERS: Dict[str, OAuthProvider] = {
             "gdrive.json",
             "gcalendar.json",
             "gcontacts.json",
-            "gmail.json",
             "google_tasks.json",
         ),
+    ),
+    "google_gmail": OAuthProvider(
+        name="google_gmail",
+        display_name="Google Gmail",
+        auth_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+        token_endpoint="https://oauth2.googleapis.com/token",
+        scopes=GOOGLE_GMAIL_SCOPES,
+        setup_url="https://console.cloud.google.com/apis/credentials",
+        setup_hint="Create an OAuth 2.0 Client ID (Web application type)",
+        extra_auth_params={"access_type": "offline", "prompt": "consent"},
+        connector_ids=("gmail",),
+        credential_files=("gmail.json",),
     ),
     "strava": OAuthProvider(
         name="strava",

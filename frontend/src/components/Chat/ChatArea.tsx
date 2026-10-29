@@ -4,7 +4,7 @@ import { MessageBubble } from './MessageBubble';
 import { InputArea } from './InputArea';
 import { StreamingDots } from './StreamingDots';
 import { useAppStore } from '../../lib/store';
-import { shouldAutoplayFinishedReply, useTtsStore } from '../../lib/tts';
+import { isStreamNotice, shouldAutoplayFinishedReply, useTtsStore } from '../../lib/tts';
 import { stripThinkTags } from '../../lib/message-text';
 import { Sparkles, PanelRightOpen, PanelRightClose, Database, MessageSquare, X } from 'lucide-react';
 import { listConnectors } from '../../lib/connectors-api';
@@ -80,7 +80,7 @@ export function ChatArea() {
       if (currentTts.autoSpokenId === completedMessageId) return;
 
       const text = stripThinkTags(currentLast.content);
-      if (!text) return;
+      if (!text || isStreamNotice(text)) return;
       currentTts.markAutoSpoken(completedMessageId);
       void currentTts.speak(completedMessageId, text);
     });

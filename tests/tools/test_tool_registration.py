@@ -96,6 +96,10 @@ EXPECTED_TOOLS = {
     "browser_extract",
     # browser_axtree.py
     "browser_axtree",
+    # gmail_tools.py — deliberately no Gmail send tool
+    "gmail_search_emails",
+    "gmail_get_thread",
+    "gmail_create_draft",
     # proactive_tools.py
     "check_permission",
     "queue_action",

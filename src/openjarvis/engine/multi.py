@@ -13,6 +13,10 @@ from openjarvis.engine._stubs import StreamChunk
 logger = logging.getLogger(__name__)
 
 
+class ModelNotFoundError(ValueError):
+    """No engine owns the requested model (a ValueError, for compatibility)."""
+
+
 class MultiEngine(InferenceEngine):
     """Wraps multiple engines and routes by model name.
 
@@ -63,10 +67,16 @@ class MultiEngine(InferenceEngine):
         # vLLM outage during a long agentic run would otherwise route every
         # call to cloud, producing confusing "invalid model ID" errors
         # across all tasks.
-        raise ValueError(
+        # The full list can be long; keep it in the log, not the message.
+        logger.info(
+            "Model %r not found; known models: %s",
+            model,
+            ", ".join(sorted(self._model_map)) or "<none>",
+        )
+        raise ModelNotFoundError(
             f"Model {model!r} not found in any engine "
-            f"(known: {', '.join(sorted(self._model_map.keys())) or '<none>'}). "
-            f"Check that the expected backend (e.g. vLLM server) is reachable."
+            f"({len(self._model_map)} models known). "
+            "Check the model name and that its backend is reachable."
         )
 
     def generate(

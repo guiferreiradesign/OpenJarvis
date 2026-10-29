@@ -73,7 +73,12 @@ class VoiceSession:
         from openjarvis.speech._tts_discovery import get_tts_backend
 
         preferred, _, _ = self.get_voice_preferences()
-        self._tts_backend = get_tts_backend(preferred, attempted=self._tts_attempted)
+        speech = getattr(self._config, "speech", None)
+        self._tts_backend = get_tts_backend(
+            preferred,
+            attempted=self._tts_attempted,
+            allow_cloud=bool(getattr(speech, "allow_cloud_tts_fallback", False)),
+        )
         return self._tts_backend
 
     def get_voice_preferences(self) -> tuple[str, str, float]:

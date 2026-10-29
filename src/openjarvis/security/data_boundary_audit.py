@@ -229,7 +229,14 @@ GENERIC_NETWORK_TOOLS = {"http_request"}
 WEATHER_TOOLS = {"get_weather"}
 MARKET_DATA_TOOLS = {"fx_macro_data"}
 CHANNEL_OUTBOUND_TOOLS = {"channel_send"}
-CONNECTOR_NETWORK_TOOLS = {"digest_collect", "execute_pending_actions"}
+# Gmail tools that call the live Gmail API (Google). Reads return mail content
+# to the model that called the tool; a draft write sends content to Gmail only.
+GMAIL_READ_TOOLS = {"gmail_search_emails", "gmail_get_thread"}
+GMAIL_DRAFT_TOOLS = {"gmail_create_draft"}
+CONNECTOR_NETWORK_TOOLS = {
+    "digest_collect",
+    "execute_pending_actions",
+} | GMAIL_READ_TOOLS | GMAIL_DRAFT_TOOLS
 CLOUD_MEDIA_TOOLS = {"audio_transcribe", "image_generate", "text_to_speech"}
 CLOUD_TTS_BACKENDS = {"cartesia", "elevenlabs", "openai", "openai_tts"}
 # Local knowledge chunks scanned by an inference engine (Deep Research path).
@@ -265,6 +272,9 @@ LOCAL_ACCESS_TOOLS = {
     "file_read",
     "file_write",
     "get_pending_actions",
+    # Writes a local pending-approval record only; it never sends and never
+    # contacts Gmail (sending is a separate, dashboard-confirmed operation).
+    "gmail_request_send_approval",
     "git_commit",
     "git_diff",
     "git_log",
@@ -1073,6 +1083,16 @@ def _audit_tool_surfaces(config: Any, builder: _FindingBuilder) -> None:
         if "execute_pending_actions" in connector_tools:
             paths.append(
                 "queued action payloads -> Gmail, Google Calendar, or iMessage"
+            )
+        if connector_tools & GMAIL_READ_TOOLS:
+            paths.append(
+                "Gmail API requests -> Google; returned email content -> the "
+                "configured AI model (hosted if a cloud engine is selected)"
+            )
+        if connector_tools & GMAIL_DRAFT_TOOLS:
+            paths.append(
+                "draft recipient, subject and body -> Gmail drafts (Google); "
+                "the draft is not sent"
             )
         builder.add(
             finding_id="connector-network-tools-configured",

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import atexit
 import concurrent.futures
+import contextvars
+import functools
 import json
 import logging
 import queue
@@ -52,8 +54,14 @@ class _BoundedToolRunner:
     ) -> concurrent.futures.Future[ToolResult] | None:
         self._ensure_started()
         future: concurrent.futures.Future[ToolResult] = concurrent.futures.Future()
+        # Workers are long-lived threads, so they do not inherit the caller's
+        # contextvars. Run each tool in a copy of the submitting context (same
+        # semantics as asyncio.to_thread) so request-scoped state such as the
+        # dashboard chat session reaches tools.
+        context = contextvars.copy_context()
+        run_in_context = functools.partial(context.run, function)
         try:
-            self._queue.put_nowait((future, function, params))
+            self._queue.put_nowait((future, run_in_context, params))
         except queue.Full:
             return None
         return future

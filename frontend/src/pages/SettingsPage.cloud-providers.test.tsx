@@ -2,6 +2,17 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
 describe('desktop cloud provider settings', () => {
+  it('links to the registered Data Sources route from Settings', async () => {
+    vi.stubGlobal('localStorage', { getItem: () => null });
+    vi.stubGlobal('window', { __TAURI_INTERNALS__: {} });
+    const { SettingsPage } = await import('./SettingsPage');
+    const html = renderToStaticMarkup(<SettingsPage />);
+
+    expect(html).toContain('href="/data-sources"');
+    expect(html).toContain('Manage Data Sources');
+    vi.unstubAllGlobals();
+  });
+
   it('offers Atlas Cloud key storage alongside its provider status', async () => {
     vi.stubGlobal('localStorage', { getItem: () => null });
     vi.stubGlobal('window', { __TAURI_INTERNALS__: {} });

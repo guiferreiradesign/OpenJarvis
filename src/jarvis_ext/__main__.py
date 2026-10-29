@@ -13,8 +13,12 @@
     python -m jarvis_ext jobs worker [--once]
     python -m jarvis_ext speech-check [--config PATH]
     python -m jarvis_ext speech-transcribe AUDIO.wav [--repeat N] [--config PATH]
+    python -m jarvis_ext speech-listen [--max-seconds N] [--device NAME|INDEX]
+        [--config PATH]
     python -m jarvis_ext speech-say TEXT --out FILE.wav [--profile P]
         [--config PATH]
+    python -m jarvis_ext preflight [--group G] [--only ID] [--list] [--json]
+        [--live-brain] [--spawn-server] [--config PATH]
 
 Prints the same JSON an agent receives.  Exit status is 0 on success, 1 when
 the tool reports an error (for example an unconfigured workspace or a failed
@@ -29,11 +33,18 @@ logs progress to stderr and prints a report when it exits; Ctrl-C (or
 SIGTERM) lets the current job finish, a second one stops it now.  It sends
 a notification for each finished job (``[jarvis.jobs] notifications``).
 
+``preflight`` verifies the running application and its essential parts
+(jarvis/preflight.md).  It prints PASS/FAIL/WARN per check with timings and
+exits 1 when any check FAILs.
+
 ``speech-*`` commands use the speech providers directly (jarvis/speech.md).
-``speech-check`` reports whether MLX Whisper and Voicebox can be used,
+``speech-check`` reports whether MLX Whisper and VoiceStudio can be used,
 without loading a model.  ``speech-transcribe`` loads the model once, then
 transcribes the file ``--repeat`` times in the same process and reports the
-cold load separately from each warm run.  ``speech-say`` writes Voicebox's
+cold load separately from each warm run.  ``speech-listen`` records one
+utterance from the microphone (Enter stops it) and transcribes it with the same
+local MLX Whisper backend; it checks that the recogniser is available before
+opening the microphone and never uses a cloud provider.  ``speech-say`` writes VoiceStudio's
 WAV to a new file (it never overwrites one).
 """
 
@@ -222,32 +233,105 @@ def _worker(args: argparse.Namespace, settings: Any) -> int:
     return 0
 
 
+def _enter_pressed() -> bool:
+    """True once a line is waiting on a terminal's stdin (never blocks)."""
+    import select
+
+    if not sys.stdin or not sys.stdin.isatty():
+        return False
+    ready, _, _ = select.select([sys.stdin], [], [], 0)
+    if ready:
+        sys.stdin.readline()
+        return True
+    return False
+
+
+def _speech_listen(args: argparse.Namespace) -> int:
+    """Record one utterance and transcribe it locally.  Errors go to stderr."""
+    from jarvis_ext.speech import capture
+    from jarvis_ext.speech.errors import SpeechError
+    from jarvis_ext.speech.mlx_whisper import MlxWhisperBackend
+
+    stt = MlxWhisperBackend(config_path=args.config)
+    # The recogniser comes first: no microphone is opened, and no audio exists,
+    # unless it can transcribe locally.  Cloud providers are never consulted.
+    reason = stt.unavailable_reason()
+    if reason:
+        print(
+            f"Speech input is not available: {reason}\n"
+            "Nothing was recorded and no audio was sent anywhere.",
+            file=sys.stderr,
+        )
+        return 1
+    limit = stt.settings.max_audio_seconds
+    max_seconds = min(args.max_seconds or capture.DEFAULT_MAX_SECONDS, limit)
+    preference = args.device if args.device is not None else stt.settings.microphone
+
+    def started(device: "capture.AudioDevice") -> None:
+        print(
+            f"Listening on {device.name} (up to {max_seconds:g} s). "
+            "Press Enter to stop, Ctrl-C to cancel.",
+            file=sys.stderr,
+        )
+
+    try:
+        recording = capture.record_utterance(
+            device_preference=preference,
+            max_seconds=max_seconds,
+            stop_requested=_enter_pressed,
+            on_start=started,
+        )
+        result = stt.transcribe(recording.wav, format="wav")
+    except capture.CaptureCancelled:
+        print("Cancelled. Nothing was transcribed.", file=sys.stderr)
+        return 130
+    except SpeechError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    text = result.text.strip()
+    if not text:
+        print("Nothing was recognised; try again.", file=sys.stderr)
+        return 1
+    timing = stt.last_timing
+    _print_json(
+        {
+            "text": text,
+            "device": recording.device.name,
+            "audio_seconds": round(recording.seconds, 3),
+            "level_rms": recording.rms,
+            "cold": bool(timing and timing.cold),
+            "inference_seconds": round(timing.inference_seconds, 4) if timing else None,
+        }
+    )
+    return 0
+
+
 def _speech(args: argparse.Namespace) -> int:
     """``speech-*`` commands.  Errors go to stderr without paths."""
     from jarvis_ext.speech.errors import SpeechError
     from jarvis_ext.speech.mlx_whisper import MlxWhisperBackend
-    from jarvis_ext.speech.voicebox import VoiceboxTTSBackend
+    from jarvis_ext.speech.voicestudio import VoiceStudioTTSBackend
 
     try:
         if args.command == "speech-check":
             stt = MlxWhisperBackend(config_path=args.config)
-            tts = VoiceboxTTSBackend(config_path=args.config)
+            tts = VoiceStudioTTSBackend(config_path=args.config)
             report: dict = {
                 "speech_input": {**stt.stats(), "error": stt.unavailable_reason()},
                 "speech_output": {
                     "backend": tts.backend_id,
                     "base_url": tts.settings.base_url,
                     "running": tts.health(),
+                    "model": tts.settings.model,
+                    "voice": tts.settings.voice,
+                    "language": tts.settings.language,
                 },
             }
-            if report["speech_output"]["running"]:
-                try:
-                    profile = tts.resolve_profile()
-                    report["speech_output"]["profile"] = profile.get("name")
-                except SpeechError as exc:
-                    report["speech_output"]["error"] = str(exc)
             _print_json(report)
             return 0
+
+        if args.command == "speech-listen":
+            return _speech_listen(args)
 
         if args.command == "speech-transcribe":
             try:
@@ -279,8 +363,8 @@ def _speech(args: argparse.Namespace) -> int:
         if args.out.exists():
             print("Cannot write audio: File exists", file=sys.stderr)
             return 1
-        tts = VoiceboxTTSBackend(config_path=args.config)
-        result = tts.synthesize(args.text, voice_id=args.profile or "")
+        tts = VoiceStudioTTSBackend(config_path=args.config)
+        result = tts.synthesize(args.text, voice_id=args.voice or "")
         try:
             with open(args.out, "xb") as fh:
                 fh.write(result.audio)
@@ -374,14 +458,33 @@ def main(argv: Optional[List[str]] = None) -> int:
     transcribe.add_argument(
         "--repeat", type=_repeat, default=1, help="Warm runs after loading (1-20)"
     )
-    say = commands.add_parser("speech-say", help="Speak text with Voicebox.")
+    listen = commands.add_parser(
+        "speech-listen", help="Record one utterance and transcribe it locally."
+    )
+    listen.add_argument(
+        "--max-seconds", type=float, help="Longest recording (default 30)"
+    )
+    listen.add_argument("--device", help="Microphone name fragment or index")
+    say = commands.add_parser("speech-say", help="Speak text with VoiceStudio.")
     say.add_argument("text")
     say.add_argument("--out", type=Path, required=True, help="New WAV file")
-    say.add_argument("--profile", help="Voicebox profile id or name")
-    for sub in (check, transcribe, say):
+    say.add_argument("--voice", help="VoiceStudio voice id (default: bm_george)")
+    for sub in (check, transcribe, listen, say):
         sub.add_argument("--config", type=Path, help="config.toml to read")
 
+    preflight = commands.add_parser(
+        "preflight", help="Verify the application and its essential components."
+    )
+    from jarvis_ext.preflight.cli import add_arguments as add_preflight_arguments
+
+    add_preflight_arguments(preflight)
+
     args = parser.parse_args(argv)
+
+    if args.command == "preflight":
+        from jarvis_ext.preflight.cli import run as run_preflight_command
+
+        return run_preflight_command(args)
 
     if args.command == "jobs":
         return _jobs(args)

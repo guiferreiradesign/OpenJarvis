@@ -11,6 +11,7 @@ import {
   resolveChatEngine,
 } from '../../lib/chat-telemetry';
 import { MicButton } from './MicButton';
+import { speechStatusText } from '../../lib/speech-input';
 import { useSpeech } from '../../hooks/useSpeech';
 import type {
   ChatMessage,
@@ -116,13 +117,21 @@ export function InputArea({
   const setDeepResearch = useAppStore((s) => s.setDeepResearch);
   const corpusSync = useResearchCorpusSync(deepResearch);
 
+  // The transcript only lands in the input box for review; sending stays manual.
   const {
     state: speechState,
     error: speechError,
+    notice: speechNotice,
     available: speechAvailable,
     startRecording,
     stopRecording,
-  } = useSpeech();
+    cancelRecording,
+  } = useSpeech({
+    onTranscript: (text) => {
+      setInput((prev) => (prev ? prev + ' ' + text : text));
+      textareaRef.current?.focus();
+    },
+  });
 
   // Abort in-flight stream when the user switches models mid-generation.
   // This prevents errors from trying to continue a stream with a stale model.
@@ -147,26 +156,25 @@ export function InputArea({
     : streamState.isStreaming ? 'streaming'
     : undefined;
 
-  useEffect(() => {
-    if (speechError) {
-      toast.error(speechError, { duration: 8000 });
-    }
-  }, [speechError]);
+  const speechStatus = speechStatusText(speechState, speechError, speechNotice);
 
   const handleMicClick = useCallback(async () => {
     if (speechState === 'recording') {
-      try {
-        const text = await stopRecording();
-        if (text) {
-          setInput((prev) => (prev ? prev + ' ' + text : text));
-        }
-      } catch {
-        // Error is captured in useSpeech
-      }
+      stopRecording();
     } else {
       await startRecording();
     }
   }, [speechState, startRecording, stopRecording]);
+
+  // Esc cancels a recording or a pending transcription without inserting anything.
+  useEffect(() => {
+    if (speechState === 'idle') return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') cancelRecording();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [speechState, cancelRecording]);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -432,6 +440,12 @@ export function InputArea({
         } else if (eventName === 'tool_call_end') {
           try {
             const data = JSON.parse(sseEvent.data);
+            if (data.tool === 'gmail_request_send_approval' && data.dashboard_token && data.result) {
+              const approvalId = JSON.parse(data.result).approval_id;
+              if (typeof approvalId === 'string') {
+                sessionStorage.setItem(`openjarvis-gmail-approval:${approvalId}`, data.dashboard_token);
+              }
+            }
             const tc = toolCalls.find(
               (t) => t.tool === data.tool && t.status === 'running',
             );
@@ -673,6 +687,33 @@ export function InputArea({
           </div>
         )}
       </div>
+      {speechStatus && (
+        <div
+          role={speechStatus.kind === 'error' ? 'alert' : 'status'}
+          aria-live={speechStatus.kind === 'error' ? 'assertive' : 'polite'}
+          className="flex items-center justify-center gap-2 mt-2 text-xs"
+          style={{
+            color:
+              speechStatus.kind === 'error'
+                ? 'var(--color-error)'
+                : speechStatus.kind === 'success'
+                  ? 'var(--color-success)'
+                  : 'var(--color-text-secondary)',
+          }}
+        >
+          <span>{speechStatus.text}</span>
+          {(speechStatus.kind === 'recording' || speechStatus.kind === 'processing') && (
+            <button
+              type="button"
+              onClick={cancelRecording}
+              className="underline cursor-pointer"
+              style={{ color: 'inherit' }}
+            >
+              Cancel
+            </button>
+          )}
+        </div>
+      )}
       <div className="flex items-center justify-center mt-2 text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
         <span>
           <kbd className="font-mono">Enter</kbd> to send &middot;{' '}

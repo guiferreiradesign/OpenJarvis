@@ -15,7 +15,7 @@ export function MicButton({ state, onClick, disabled, reason }: MicButtonProps) 
     reason === 'not-enabled'
       ? 'Enable in Settings'
       : reason === 'no-backend'
-        ? 'Speech backend not configured'
+        ? 'Local speech recognition is not available'
         : reason === 'streaming'
           ? 'Wait for response'
           : state === 'recording'
@@ -33,8 +33,12 @@ export function MicButton({ state, onClick, disabled, reason }: MicButtonProps) 
       onMouseLeave={() => setShowTooltip(false)}
     >
       <button
+        type="button"
         onClick={onClick}
         disabled={isInactive}
+        aria-label={tooltipText}
+        aria-pressed={state === 'recording'}
+        title={tooltipText}
         className="p-2 rounded-xl transition-all shrink-0"
         style={{
           background: state === 'recording'

@@ -226,6 +226,9 @@ def serve(
             from openjarvis.engine.cloud import CloudEngine
 
             cloud_engine = CloudEngine()
+            from openjarvis.engine._discovery import apply_openrouter_policy
+
+            apply_openrouter_policy(cloud_engine, config)
             if cloud_engine.health():
                 console.print("  Cloud:  [cyan]enabled[/cyan] (API keys detected)")
             else:
@@ -345,6 +348,12 @@ def serve(
 
                     tools = []
                     for name in ToolRegistry.keys():
+                        # Gmail capabilities are attached from a fixed
+                        # read/thread-read/draft allowlist below. This prevents
+                        # an extra Gmail registry entry (including a future
+                        # send tool) from becoming agent-callable by config.
+                        if name.startswith("gmail_"):
+                            continue
                         if name not in allowed:
                             continue
                         tool_cls = ToolRegistry.get(name)
@@ -357,9 +366,21 @@ def serve(
                         elif isinstance(tool_cls, BaseTool):
                             tools.append(tool_cls)
 
+                    # Gmail access is a dashboard orchestrator capability only.
+                    # The fixed helper returns exactly read, thread-read, and
+                    # draft tools; no sending capability is registered here.
+                    from openjarvis.tools.gmail_tools import dashboard_gmail_tools
+
+                    tools.extend(dashboard_gmail_tools(agent_key))
+
                     # MCP server tools from config.tools.mcp.servers
                     # (#461 — these were silently dropped).
                     mcp_tools = managed_mcp_tools
+                    mcp_tools = [
+                        tool
+                        for tool in mcp_tools
+                        if not tool.spec.name.startswith("gmail_")
+                    ]
                     if tools_configured:
                         mcp_tools = [
                             tool
@@ -474,6 +495,8 @@ def serve(
                         _allowed, _tools_configured = _resolve_allowed_tools(config)
 
                         for _tname in ToolRegistry.keys():
+                            if _tname.startswith("gmail_"):
+                                continue
                             if _tname not in _allowed:
                                 continue
                             _tcls = ToolRegistry.get(_tname)
@@ -489,6 +512,11 @@ def serve(
                         # Reuse the process-owned MCP pool so channels do not
                         # open a second transport to every configured server.
                         _ch_mcp_tools = managed_mcp_tools
+                        _ch_mcp_tools = [
+                            tool
+                            for tool in _ch_mcp_tools
+                            if not tool.spec.name.startswith("gmail_")
+                        ]
                         if _tools_configured:
                             _ch_mcp_tools = [
                                 tool
