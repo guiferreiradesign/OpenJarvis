@@ -13,6 +13,7 @@ Supports two modes:
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import json
 import logging
 import re
@@ -454,7 +455,10 @@ class OrchestratorAgent(ToolUsingAgent):
                         max_workers=len(approved_calls),
                     ) as pool:
                         futures = {
-                            pool.submit(_exec_tool, tc): tc for tc in approved_calls
+                            pool.submit(
+                                contextvars.copy_context().run, _exec_tool, tc
+                            ): tc
+                            for tc in approved_calls
                         }
                         for future in concurrent.futures.as_completed(futures):
                             tc_orig = futures[future]

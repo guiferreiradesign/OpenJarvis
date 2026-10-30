@@ -108,6 +108,8 @@ interface Settings {
   speechEnabled: boolean;
   voiceOutputEnabled: boolean;
   voiceAutoplay: boolean;
+  /** Wake phrase model: 'jarvis' (default) or 'hey_jarvis'. Whether detection is on is never persisted. */
+  wakeModel: 'jarvis' | 'hey_jarvis';
 }
 
 function loadSettings(): Settings {
@@ -123,6 +125,7 @@ function loadSettings(): Settings {
     speechEnabled: false,
     voiceOutputEnabled: false,
     voiceAutoplay: false,
+    wakeModel: 'jarvis',
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);

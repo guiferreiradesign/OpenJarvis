@@ -12,11 +12,18 @@ export interface ChatRequest {
 export async function* streamChat(
   request: ChatRequest,
   signal?: AbortSignal,
+  options: { inputMode?: 'voice' } = {},
 ): AsyncGenerator<SSEEvent> {
   const base = getBase();
   const response = await fetch(`${base}/v1/chat/completions`, {
     method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json', 'X-OpenJarvis-Chat-Session': getDashboardSessionId() }),
+    headers: authHeaders({
+      'Content-Type': 'application/json',
+      'X-OpenJarvis-Chat-Session': getDashboardSessionId(),
+      // Voice-originated turns run under a restricted server-side tool policy.
+      // The header can only ask for more restriction, never less.
+      ...(options.inputMode === 'voice' ? { 'X-OpenJarvis-Input-Mode': 'voice' } : {}),
+    }),
     body: JSON.stringify(request),
     signal,
   });

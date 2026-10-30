@@ -131,3 +131,7 @@ learning.db
 minion_logs/
 *.oj-debug.json
 oj-debug.*.json
+
+# Third-party wake-word ONNX models (personal use only; never commit)
+frontend/public/wake-models/*
+!frontend/public/wake-models/README.md

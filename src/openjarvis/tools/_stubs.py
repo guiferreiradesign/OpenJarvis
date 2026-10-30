@@ -285,6 +285,36 @@ class ToolExecutor:
                 success=False,
             )
 
+        # Voice-originated turns run under a restricted, fail-closed policy that
+        # is independent of any configured CapabilityPolicy (which may be absent
+        # or permissive). The mode only ever narrows what may run.
+        try:
+            from openjarvis.security.input_mode import (
+                is_voice_turn,
+                voice_denial_reason,
+            )
+
+            voice_turn = is_voice_turn()
+            voice_reason = voice_denial_reason(tool) if voice_turn else None
+        except Exception as exc:  # cannot establish the policy: deny, never allow
+            voice_turn = True
+            voice_reason = f"Voice tool policy could not be established ({exc})."
+        if voice_turn and voice_reason is not None:
+            if self._bus:
+                self._bus.publish(
+                    EventType.CAPABILITY_DENIED,
+                    {
+                        "agent_id": self._agent_id,
+                        "capability": "input_mode:voice",
+                        "tool": tool_call.name,
+                    },
+                )
+            return ToolResult(
+                tool_name=tool_call.name,
+                content=voice_reason,
+                success=False,
+            )
+
         # Rate limiting — checked before any other gate so a hammering
         # agent/skill can't burn through boundary/capability/taint checks.
         if self._rate_limiter is not None:

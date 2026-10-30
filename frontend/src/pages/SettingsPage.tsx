@@ -19,6 +19,10 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { useAppStore, type ThemeMode } from '../lib/store';
+import { useWakeStore } from '../lib/wake/store';
+import { useHandsFreeStore } from '../lib/wake-capture/store';
+import { WAKE_MODELS, resolveWakeModel, type WakeModelId } from '../lib/wake/models';
+import { HANDS_FREE_LABEL } from '../lib/wake-capture/phase';
 import {
   checkHealth,
   fetchSpeechHealth,
@@ -288,6 +292,10 @@ const themeOptions: { value: ThemeMode; label: string; icon: typeof Sun }[] = [
 export function SettingsPage() {
   const settings = useAppStore((s) => s.settings);
   const updateSettings = useAppStore((s) => s.updateSettings);
+  const wake = useHandsFreeStore();
+  const wakeState = useWakeStore((s) => s.state);
+  const wakeError = useWakeStore((s) => s.error);
+  const wakeOn = wakeState !== 'off' && wakeState !== 'error';
   const conversations = useAppStore((s) => s.conversations);
   const serverInfo = useAppStore((s) => s.serverInfo);
   const [healthy, setHealthy] = useState<boolean | null>(null);
@@ -865,6 +873,56 @@ export function SettingsPage() {
                     : 'Not configured'}
                 </span>
               </div>
+            </SettingRow>
+            <SettingRow
+              label="Hands-free mode (wake word)"
+              description="Listens on this Mac for the wake phrase, then records one request and transcribes it locally with Whisper. After a 1.5 second cancellation window the request is sent to chat and the reply is spoken by George. Voice requests run with a restricted tool policy (no code, file writes, messages, scheduling or Gmail). Text you are typing is never overwritten or sent. The browser's microphone indicator stays on while listening. Off by default and not remembered between visits"
+            >
+              <div className="flex items-center gap-2">
+                <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                  {HANDS_FREE_LABEL[wake.phase]}
+                </span>
+                <button
+                  onClick={() => (wakeOn ? void wake.stop() : void wake.start(settings.wakeModel))}
+                  className="relative w-11 h-6 rounded-full transition-colors cursor-pointer"
+                  aria-label="Hands-free mode"
+                  aria-pressed={wakeOn}
+                  style={{
+                    background: wakeOn ? 'var(--color-accent)' : 'var(--color-bg-tertiary)',
+                  }}
+                >
+                  <span
+                    className="absolute top-0.5 left-0.5 w-5 h-5 rounded-full transition-transform bg-white"
+                    style={{
+                      transform: wakeOn ? 'translateX(20px)' : 'translateX(0)',
+                      boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
+                    }}
+                  />
+                </button>
+              </div>
+            </SettingRow>
+            {wake.phase === 'error' && (wakeError ?? wake.capture.error) && (
+              <div role="alert" className="text-xs py-1" style={{ color: 'var(--color-error)' }}>{wakeError ?? wake.capture.error}</div>
+            )}
+            <SettingRow label="Wake phrase" description="Applies the next time detection is switched on; switching while listening restarts it">
+              <select
+                value={resolveWakeModel(settings.wakeModel)}
+                onChange={(e) => {
+                  const next = resolveWakeModel(e.target.value) as WakeModelId;
+                  updateSettings({ wakeModel: next });
+                  showSaved();
+                  if (wakeOn) {
+                    void wake.stop().then(() => wake.start(next));
+                  }
+                }}
+                className="text-sm rounded px-2 py-1"
+                style={{ background: 'var(--color-bg-tertiary)', color: 'var(--color-text)', border: '1px solid var(--color-border-subtle)' }}
+                aria-label="Wake phrase"
+              >
+                {Object.values(WAKE_MODELS).map((m) => (
+                  <option key={m.id} value={m.id}>{m.phrase}{m.id === 'jarvis' ? ' (default)' : ''}</option>
+                ))}
+              </select>
             </SettingRow>
             <SettingRow label="Backend status" description="Local speech recognition (MLX Whisper); audio never leaves this Mac">
               <div className="flex items-center gap-2">

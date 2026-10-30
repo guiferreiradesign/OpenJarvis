@@ -6,6 +6,7 @@ import { StreamingDots } from './StreamingDots';
 import { useAppStore } from '../../lib/store';
 import { isStreamNotice, shouldAutoplayFinishedReply, useTtsStore } from '../../lib/tts';
 import { stripThinkTags } from '../../lib/message-text';
+import { isVoiceReply } from '../../lib/wake-capture/bridge';
 import { Sparkles, PanelRightOpen, PanelRightClose, Database, MessageSquare, X } from 'lucide-react';
 import { listConnectors } from '../../lib/connectors-api';
 
@@ -58,6 +59,7 @@ export function ChatArea() {
       streamState.isStreaming,
       last,
       tts.autoSpokenId,
+      isVoiceReply(last?.id),
     );
     streamingConversationRef.current = isCurrentChatStreaming ? activeId : null;
 
@@ -78,6 +80,7 @@ export function ChatArea() {
       if (!app.settings.voiceOutputEnabled || !app.settings.voiceAutoplay) return;
       if (currentLast?.id !== completedMessageId || currentTts.available !== true) return;
       if (currentTts.autoSpokenId === completedMessageId) return;
+      if (isVoiceReply(completedMessageId)) return;
 
       const text = stripThinkTags(currentLast.content);
       if (!text || isStreamNotice(text)) return;

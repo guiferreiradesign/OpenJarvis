@@ -43,8 +43,11 @@ export function shouldAutoplayFinishedReply(
   streamIsActive: boolean,
   lastMessage: { id: string; role: string } | undefined,
   autoSpokenId: string | null,
+  /** Replies to hands-free voice turns are spoken by hands-free mode itself. */
+  isVoiceReply = false,
 ): boolean {
-  return previousStreamingConversationId !== null
+  return !isVoiceReply
+    && previousStreamingConversationId !== null
     && previousStreamingConversationId === activeId
     && !streamIsActive
     && lastMessage !== undefined

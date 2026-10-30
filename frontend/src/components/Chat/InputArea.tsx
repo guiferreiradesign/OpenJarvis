@@ -13,6 +13,13 @@ import {
 import { MicButton } from './MicButton';
 import { speechStatusText } from '../../lib/speech-input';
 import { useSpeech } from '../../hooks/useSpeech';
+import { WakeTranscriptReview } from '../Wake/WakeTranscriptReview';
+import {
+  markVoiceReply,
+  notifyDraftChanged,
+  registerChatBridge,
+  type VoiceTurnResult,
+} from '../../lib/wake-capture/bridge';
 import type {
   ChatMessage,
   MessageTelemetry,
@@ -192,15 +199,17 @@ export function InputArea({
     resetStream();
   }, [resetStream]);
 
-  const sendMessage = useCallback(async () => {
-    const content = input.trim();
-    if (!content || streamState.isStreaming) return;
-    if (!selectedModel) {
-      toast.error('Pick a model first (⌘K)');
-      return;
-    }
-
-    setInput('');
+  // One conversation turn. Typed messages and hands-free voice turns both run
+  // through here, so history, streaming and error handling are identical; the
+  // only differences are the voice header (a restricted server-side tool policy)
+  // and that a voice turn never uses Deep Research or touches the input box.
+  const runTurn = useCallback(async (
+    content: string,
+    origin: 'typed' | 'voice',
+  ): Promise<VoiceTurnResult> => {
+    if (!content || streamState.isStreaming || !selectedModel) return { status: 'rejected' };
+    const researchMode = deepResearch && origin === 'typed';
+    let outcome: 'completed' | 'failed' | 'aborted' = 'completed';
 
     let convId = activeId;
     if (!convId) {
@@ -227,9 +236,11 @@ export function InputArea({
       role: 'assistant',
       content: '',
       timestamp: Date.now(),
-      isResearch: deepResearch || undefined,
+      isResearch: researchMode || undefined,
     };
     addMessage(convId, assistantMsg);
+    // Mark before streaming starts so the typed-message autoplay can never claim it.
+    if (origin === 'voice') markVoiceReply(assistantMsg.id);
 
     // Start streaming
     const startTime = Date.now();
@@ -262,7 +273,7 @@ export function InputArea({
     setStreamState({
       conversationId: convId,
       isStreaming: true,
-      phase: deepResearch ? 'Researching...' : 'Generating...',
+      phase: researchMode ? 'Researching...' : 'Generating...',
       elapsedMs: 0,
       activeToolCalls: [],
       content: '',
@@ -272,13 +283,13 @@ export function InputArea({
       timestamp: Date.now(),
       level: 'info',
       category: 'chat',
-      message: deepResearch
+      message: researchMode
         ? `Research: "${content.slice(0, 80)}${content.length > 80 ? '...' : ''}"`
         : `Request: "${content.slice(0, 80)}${content.length > 80 ? '...' : ''}" → ${selectedModel}`,
     });
 
     try {
-      if (deepResearch) {
+      if (researchMode) {
         for await (const ev of streamResearch(
           content,
           selectedModel,
@@ -376,6 +387,7 @@ export function InputArea({
               category: 'chat',
               message: `Deep Research error: ${msg}`,
             });
+            outcome = 'failed';
             toast.error(msg, { duration: 8000 });
           } else if (ev.type === 'done') {
             if (ev.usage) {
@@ -406,6 +418,7 @@ export function InputArea({
       for await (const sseEvent of streamChat(
         { model: selectedModel, messages: apiMessages, stream: true, temperature, max_tokens: maxTokens },
         controller.signal,
+        origin === 'voice' ? { inputMode: 'voice' } : {},
       )) {
         const eventName = sseEvent.event;
 
@@ -489,6 +502,7 @@ export function InputArea({
       }
     } catch (err: any) {
       if (err.name === 'AbortError') {
+        outcome = 'aborted';
         // User cancelled or model switch — keep whatever was accumulated
         if (!accumulatedContent) {
           accumulatedContent = timedOut
@@ -497,6 +511,7 @@ export function InputArea({
         }
       } else {
         const errMsg = err?.message || String(err);
+        outcome = 'failed';
         accumulatedContent =
           accumulatedContent || `Error: ${errMsg}`;
         useAppStore.getState().addLogEntry({
@@ -511,6 +526,7 @@ export function InputArea({
       window.clearTimeout(timeout);
       if (!accumulatedContent) {
         accumulatedContent = 'No response was generated. Please try again.';
+        outcome = 'failed';
       }
       const totalMs = Date.now() - startTime;
       const appState = useAppStore.getState();
@@ -573,14 +589,17 @@ export function InputArea({
       // `done` event's usage payload — re-fetching here would overwrite
       // it with a potentially stale snapshot if the server's research
       // telemetry hasn't been merged into /v1/savings yet.
-      if (!deepResearch) {
+      if (!researchMode) {
         fetchSavings()
           .then((data) => useAppStore.getState().setSavings(data))
           .catch(() => {});
       }
     }
+    if (outcome === 'completed') {
+      return { status: 'completed', messageId: assistantMsg.id, text: accumulatedContent };
+    }
+    return { status: outcome };
   }, [
-    input,
     activeId,
     selectedModel,
     streamState.isStreaming,
@@ -594,6 +613,30 @@ export function InputArea({
     maxTokens,
     onMessageStart,
   ]);
+
+  const sendMessage = useCallback(async () => {
+    const content = input.trim();
+    if (!content || streamState.isStreaming) return;
+    if (!selectedModel) {
+      toast.error('Pick a model first (⌘K)');
+      return;
+    }
+    setInput('');
+    await runTurn(content, 'typed');
+  }, [input, streamState.isStreaming, selectedModel, runTurn]);
+
+  // Hands-free mode reaches the chat only through this bridge. It reads live
+  // values through a ref so the registration is stable across renders.
+  const bridgeRef = useRef({ input, runTurn, canSubmit: !!selectedModel && !streamState.isStreaming, stopStreaming });
+  bridgeRef.current = { input, runTurn, canSubmit: !!selectedModel && !streamState.isStreaming, stopStreaming };
+  useEffect(() => registerChatBridge({
+    getDraft: () => bridgeRef.current.input,
+    canSubmit: () => bridgeRef.current.canSubmit,
+    submit: (text) => bridgeRef.current.runTurn(text, 'voice'),
+    abort: () => bridgeRef.current.stopStreaming(),
+    speechOutputEnabled: () => useAppStore.getState().settings.voiceOutputEnabled,
+  }), []);
+  useEffect(() => notifyDraftChanged(input), [input]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -636,6 +679,7 @@ export function InputArea({
           </div>
         )}
       </div>}
+      <WakeTranscriptReview draft={input} onChange={setInput} />
       <div
         className="flex items-center gap-2 rounded-2xl px-4 py-3 transition-shadow"
         style={{

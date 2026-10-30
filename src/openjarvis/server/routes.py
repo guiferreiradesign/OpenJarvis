@@ -160,6 +160,15 @@ def _ensure_identity_prompt(messages: list[Message], app_config) -> list[Message
 @router.post("/v1/chat/completions")
 async def chat_completions(request_body: ChatCompletionRequest, request: Request):
     """Handle chat completion requests (streaming and non-streaming)."""
+    from openjarvis.security.input_mode import (
+        INPUT_MODE_HEADER,
+        input_mode_scope,
+        mode_from_header,
+    )
+
+    # Voice-originated turns get a restricted tool policy, enforced in the
+    # ToolExecutor. The header can only select *more* restriction.
+    input_mode = mode_from_header(request.headers.get(INPUT_MODE_HEADER))
     engine = request.app.state.engine
     agent = getattr(request.app.state, "agent", None)
     model = request_body.model
@@ -309,6 +318,7 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 bus=getattr(request.app.state, "bus", None),
                 memory_service=getattr(request.app.state, "memory_service", None),
                 dashboard_session_id=request.headers.get("X-OpenJarvis-Chat-Session", ""),
+                input_mode=input_mode,
             )
         return await _handle_stream(
             engine,
@@ -342,15 +352,18 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     # worker thread so a slow/wedged non-streaming request can't stall the
     # event loop and every other concurrent request with it.
     if use_server_agent:
-        response = await asyncio.to_thread(
-            _handle_agent,
-            agent,
-            model,
-            request_body,
-            complexity_info,
-            trace_store=getattr(request.app.state, "trace_store", None),
-            bus=getattr(request.app.state, "bus", None),
-        )
+        # to_thread copies the current context, so the worker thread sees the
+        # mode; the scope restores it even if the agent raises.
+        with input_mode_scope(input_mode):
+            response = await asyncio.to_thread(
+                _handle_agent,
+                agent,
+                model,
+                request_body,
+                complexity_info,
+                trace_store=getattr(request.app.state, "trace_store", None),
+                bus=getattr(request.app.state, "bus", None),
+            )
     else:
         bus = getattr(request.app.state, "bus", None)
         response = await asyncio.to_thread(
@@ -684,6 +697,7 @@ async def _handle_agent_stream(
     bus=None,
     memory_service=None,
     dashboard_session_id: str = "",
+    input_mode: str = "",
 ):
     """Run the configured agent and return its result as an SSE response.
 
@@ -760,6 +774,9 @@ async def _handle_agent_stream(
 
         from openjarvis.server.gmail_approval import current_dashboard_session
         session_token = current_dashboard_session.set(dashboard_session_id)
+        from openjarvis.security.input_mode import current_input_mode
+
+        mode_token = current_input_mode.set(input_mode)
         agent_task = asyncio.create_task(
             asyncio.to_thread(
                 _handle_agent,
@@ -772,6 +789,7 @@ async def _handle_agent_stream(
             )
         )
         current_dashboard_session.reset(session_token)
+        current_input_mode.reset(mode_token)
 
         def _agent_done(_task):
             try:
@@ -1477,6 +1495,9 @@ async def server_info(request: Request):
         "model": getattr(request.app.state, "model", ""),
         "agent": agent_id,
         "engine": getattr(request.app.state, "engine_name", ""),
+        # Lets the dashboard confirm the server enforces the restricted
+        # voice-turn tool policy before it ever auto-submits a spoken request.
+        "voice_input_policy": 1,
     }
 
 

@@ -482,6 +482,21 @@ export async function fetchTtsHealth(): Promise<TtsHealth> {
   return res.json();
 }
 
+/**
+ * True only when the server reports it enforces the restricted voice-turn tool
+ * policy. Hands-free auto-submit stays off unless this is confirmed.
+ */
+export async function fetchVoiceInputPolicy(): Promise<boolean> {
+  try {
+    const res = await apiFetch(`/v1/info`);
+    if (!res.ok) return false;
+    const info = await res.json();
+    return info?.voice_input_policy === 1;
+  } catch {
+    return false;
+  }
+}
+
 export async function fetchSpeechHealth(): Promise<SpeechHealth> {
   if (isTauri()) {
     try {

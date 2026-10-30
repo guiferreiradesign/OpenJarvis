@@ -124,6 +124,10 @@ router = APIRouter()
 
 
 def _request_binding(request: Request) -> tuple[str, str]:
+    from openjarvis.security.input_mode import INPUT_MODE_HEADER, mode_from_header
+    # A voice-originated request can never read, cancel or confirm an approval.
+    if mode_from_header(request.headers.get(INPUT_MODE_HEADER)):
+        raise HTTPException(status_code=403, detail="Voice-originated requests cannot manage Gmail approvals.")
     import hashlib
     from openjarvis.connectors.gmail import GmailConnector
     from openjarvis.tools.gmail_tools import _account_binding
